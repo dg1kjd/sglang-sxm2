@@ -1072,6 +1072,11 @@ class Envs:
     # NVFP4 checkpoints with a BF16 NextN layer: quantize the draft's routed experts
     # to NVFP4 on load. Draft-only, so verify still decides every emitted token.
     SGLANG_NVFP4_CKPT_NVFP4_NEXTN_MOE = EnvBool(False)
+    # NVFP4 checkpoints whose NextN routed experts are ALREADY serialized as
+    # packed NVFP4 (uint8 weights + E4M3 scales) instead of BF16: keep the
+    # modelopt_fp4 config on the draft layer so those tensors load directly.
+    # Without this the draft MoE is built as BF16 and the shapes mismatch.
+    SGLANG_NVFP4_CKPT_NEXTN_MOE_SERIALIZED = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)

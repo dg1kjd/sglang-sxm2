@@ -82,11 +82,20 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not envs.SGLANG_NVFP4_CKPT_NEXTN_MOE_SERIALIZED.get()
+        ):
             logger.debug(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
             quant_config = None
+        elif envs.SGLANG_NVFP4_CKPT_NEXTN_MOE_SERIALIZED.get():
+            logger.info(
+                "NextN routed experts are already serialized NVFP4; "
+                "loading the draft MoE directly."
+            )
 
         self.vocab_size = config.vocab_size
 
