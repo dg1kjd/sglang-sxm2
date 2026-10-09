@@ -1213,7 +1213,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             intermediate_states_buffer=intermediate_state_cache,
-            intermediate_state_indices=intermediate_state_indices,
+            intermediate_state_indices=intermediate_state_indices[:batch_size],
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,

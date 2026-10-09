@@ -2,6 +2,10 @@
 // the Triton / TileLang DSA kernels only accept bf16 or fp8. This kernel is
 // the fp16 path: K and V are the same 512-d latent, rope tail is 0.
 //
+// The KV pool may also hold unscaled FP8 E4M3 bytes (SGLANG_SM70_DSA_FP8_KV).
+// Volta has no FP8 arithmetic, so those rows are widened to fp16 while they
+// are staged into shared memory; everything after staging is unchanged.
+//
 // One block owns one query token, up to 8 heads (one warp each) and one
 // split of the topk slots. Rows are staged 32 at a time in shared memory and
 // every head dots against them; invalid (negative) indices are skipped.
@@ -16,6 +20,8 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <cuda_fp8.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -29,7 +35,7 @@ constexpr int kSparseMlaSm70Chunk = 32;
 
 struct SparseMlaSm70Params {
   const fp16_t* __restrict__ q;       // [S, H, 512]
-  const fp16_t* __restrict__ kv;      // row stride = stride_kv
+  const void* __restrict__ kv;        // fp16 or E4M3 bytes; row stride = stride_kv elements
   const int32_t* __restrict__ indices;  // [S, topk]
   fp16_t* __restrict__ out;           // [S, H, 512]
   fp32_t* __restrict__ part_acc;      // [S, H, splits, 512], splits > 1 only
@@ -52,7 +58,21 @@ SGL_DEVICE float sparse_mla_sm70_warp_sum(float v) {
   return v;
 }
 
-template <bool kVec16>
+// Eight E4M3 bytes -> eight fp16 values (four half2), software conversion.
+SGL_DEVICE uint4 sparse_mla_sm70_e4m3x8_to_half(uint2 raw) {
+  const __half2_raw h0 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x & 0xffffu), __NV_E4M3);
+  const __half2_raw h1 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x >> 16), __NV_E4M3);
+  const __half2_raw h2 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y & 0xffffu), __NV_E4M3);
+  const __half2_raw h3 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y >> 16), __NV_E4M3);
+  uint4 out;
+  out.x = static_cast<uint32_t>(h0.x) | (static_cast<uint32_t>(h0.y) << 16);
+  out.y = static_cast<uint32_t>(h1.x) | (static_cast<uint32_t>(h1.y) << 16);
+  out.z = static_cast<uint32_t>(h2.x) | (static_cast<uint32_t>(h2.y) << 16);
+  out.w = static_cast<uint32_t>(h3.x) | (static_cast<uint32_t>(h3.y) << 16);
+  return out;
+}
+
+template <bool kVec16, bool kFp8>
 __global__ void __launch_bounds__(kSparseMlaSm70Threads) sparse_mla_sm70_kernel(SparseMlaSm70Params p) {
   const uint32_t seq = blockIdx.x;
   const uint32_t split = blockIdx.z;
@@ -91,7 +111,21 @@ __global__ void __launch_bounds__(kSparseMlaSm70Threads) sparse_mla_sm70_kernel(
       s_idx[threadIdx.x] = static_cast<int>(threadIdx.x) < n ? idx_row[c0 + threadIdx.x] : -1;
     }
     __syncthreads();
-    if constexpr (kVec16) {
+    if constexpr (kFp8) {
+      // Eight E4M3 bytes per load (rows are 8-byte aligned), widened into fp16.
+      const uint8_t* kv8 = static_cast<const uint8_t*>(p.kv);
+      constexpr int kPerRow = kSparseMlaSm70Dim / 8;
+      for (int e = threadIdx.x; e < kSparseMlaSm70Chunk * kPerRow; e += kSparseMlaSm70Threads) {
+        const int r = e / kPerRow;
+        const int col = (e % kPerRow) * 8;
+        const int32_t idx = s_idx[r];
+        if (idx >= 0) {
+          const uint2 raw = *reinterpret_cast<const uint2*>(kv8 + static_cast<int64_t>(idx) * p.stride_kv + col);
+          *reinterpret_cast<uint4*>(&s_kv[r][col]) = sparse_mla_sm70_e4m3x8_to_half(raw);
+        }
+      }
+    } else if constexpr (kVec16) {
+      const fp16_t* kv16 = static_cast<const fp16_t*>(p.kv);
       constexpr int kPerRow = kSparseMlaSm70Dim / 8;
       for (int e = threadIdx.x; e < kSparseMlaSm70Chunk * kPerRow; e += kSparseMlaSm70Threads) {
         const int r = e / kPerRow;
@@ -99,10 +133,11 @@ __global__ void __launch_bounds__(kSparseMlaSm70Threads) sparse_mla_sm70_kernel(
         const int32_t idx = s_idx[r];
         if (idx >= 0) {
           *reinterpret_cast<uint4*>(&s_kv[r][col]) =
-              *reinterpret_cast<const uint4*>(p.kv + static_cast<int64_t>(idx) * p.stride_kv + col);
+              *reinterpret_cast<const uint4*>(kv16 + static_cast<int64_t>(idx) * p.stride_kv + col);
         }
       }
     } else {
+      const fp16_t* kv16 = static_cast<const fp16_t*>(p.kv);
       constexpr int kPerRow = kSparseMlaSm70Dim / 2;
       for (int e = threadIdx.x; e < kSparseMlaSm70Chunk * kPerRow; e += kSparseMlaSm70Threads) {
         const int r = e / kPerRow;
@@ -110,7 +145,7 @@ __global__ void __launch_bounds__(kSparseMlaSm70Threads) sparse_mla_sm70_kernel(
         const int32_t idx = s_idx[r];
         if (idx >= 0) {
           *reinterpret_cast<fp16x2_t*>(&s_kv[r][col]) =
-              *reinterpret_cast<const fp16x2_t*>(p.kv + static_cast<int64_t>(idx) * p.stride_kv + col);
+              *reinterpret_cast<const fp16x2_t*>(kv16 + static_cast<int64_t>(idx) * p.stride_kv + col);
         }
       }
     }
@@ -209,7 +244,7 @@ struct SparseMlaSm70Kernel {
 
   /// \brief Sparse attention over indexer-selected latent rows.
   /// \param q `[S, H, 512]` fp16
-  /// \param kv `[N, 512]` or `[N, 1, 512]` fp16. Index `i` selects row `i`.
+  /// \param kv `[N, 512]` or `[N, 1, 512]` fp16, or uint8 holding unscaled E4M3. Index `i` selects row `i`.
   /// \param indices `[S, topk]` int32. Negative entries are masked out.
   /// \param out `[S, H, 512]` fp16
   /// \param part_acc fp32 workspace, at least `S * H * splits * 512` when splits > 1
@@ -258,11 +293,17 @@ struct SparseMlaSm70Kernel {
         "out must be contiguous [S, H, 512]");
     RuntimeCheck(indices.stride(0) == static_cast<int64_t>(topk), "indices must be contiguous [S, topk]");
 
+    // kv is fp16, or uint8 holding unscaled E4M3 bytes (strides then count bytes).
+    auto kv_dtype = SymbolicDType{};
     int64_t stride_kv = 0;
     if (kv.ndim() == 2) {
       auto N_ = SymbolicSize{"kv_rows"};
       auto Dk_ = SymbolicSize{"kv_dim"};
-      TensorMatcher({N_, Dk_}).with_dtype<fp16_t>().with_device(device).with_strides({-1, 1}).verify(kv);
+      TensorMatcher({N_, Dk_})
+          .with_dtype<fp16_t, uint8_t>(kv_dtype)
+          .with_device(device)
+          .with_strides({-1, 1})
+          .verify(kv);
       RuntimeCheck(Dk_.unwrap() == kSparseMlaSm70Dim, "kv last dim must be 512");
       stride_kv = kv.stride(0);
     } else if (kv.ndim() == 3) {
@@ -270,7 +311,7 @@ struct SparseMlaSm70Kernel {
       auto P_ = SymbolicSize{"page"};
       auto Dk_ = SymbolicSize{"kv_dim"};
       TensorMatcher({N_, P_, Dk_})
-          .with_dtype<fp16_t>()
+          .with_dtype<fp16_t, uint8_t>(kv_dtype)
           .with_device(device)
           .with_strides({-1, -1, 1})
           .verify(kv);
@@ -279,9 +320,17 @@ struct SparseMlaSm70Kernel {
     } else {
       RuntimeCheck(false, "kv must be [N, 512] or [N, 1, 512]");
     }
-    RuntimeCheck(stride_kv > 0 && (stride_kv % 2) == 0, "kv row stride must be a positive even number of fp16 elements");
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(kv.data_ptr()) % 4 == 0, "kv base must be 4-byte aligned for half2 loads");
+    const bool kv_fp8 = kv_dtype.is_type<uint8_t>();
+    if (kv_fp8) {
+      RuntimeCheck(stride_kv > 0 && (stride_kv % 8) == 0, "fp8 kv row stride must be a positive multiple of 8 bytes");
+      RuntimeCheck(
+          reinterpret_cast<uintptr_t>(kv.data_ptr()) % 8 == 0, "fp8 kv base must be 8-byte aligned");
+    } else {
+      RuntimeCheck(
+          stride_kv > 0 && (stride_kv % 2) == 0, "kv row stride must be a positive even number of fp16 elements");
+      RuntimeCheck(
+          reinterpret_cast<uintptr_t>(kv.data_ptr()) % 4 == 0, "kv base must be 4-byte aligned for half2 loads");
+    }
 
     if (S == 0 || H == 0) {
       return;
@@ -303,7 +352,7 @@ struct SparseMlaSm70Kernel {
 
     const SparseMlaSm70Params params{
         .q = static_cast<const fp16_t*>(q.data_ptr()),
-        .kv = static_cast<const fp16_t*>(kv.data_ptr()),
+        .kv = kv.data_ptr(),
         .indices = static_cast<const int32_t*>(indices.data_ptr()),
         .out = static_cast<fp16_t*>(out.data_ptr()),
         .part_acc = n_splits > 1 ? static_cast<fp32_t*>(part_acc.data_ptr()) : nullptr,
@@ -323,10 +372,12 @@ struct SparseMlaSm70Kernel {
     dim3 grid(static_cast<uint32_t>(S), head_tiles, n_splits);
     const bool vec16 =
         stride_kv % 8 == 0 && reinterpret_cast<uintptr_t>(kv.data_ptr()) % 16 == 0;
-    if (vec16) {
-      LaunchKernel(grid, kSparseMlaSm70Threads, device.unwrap())(sparse_mla_sm70_kernel<true>, params);
+    if (kv_fp8) {
+      LaunchKernel(grid, kSparseMlaSm70Threads, device.unwrap())(sparse_mla_sm70_kernel<true, true>, params);
+    } else if (vec16) {
+      LaunchKernel(grid, kSparseMlaSm70Threads, device.unwrap())(sparse_mla_sm70_kernel<true, false>, params);
     } else {
-      LaunchKernel(grid, kSparseMlaSm70Threads, device.unwrap())(sparse_mla_sm70_kernel<false>, params);
+      LaunchKernel(grid, kSparseMlaSm70Threads, device.unwrap())(sparse_mla_sm70_kernel<false, false>, params);
     }
     if (n_splits > 1) {
       LaunchKernel(dim3(static_cast<uint32_t>(S), H), kSparseMlaSm70Threads, device.unwrap())(

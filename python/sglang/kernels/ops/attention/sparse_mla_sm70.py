@@ -1,8 +1,8 @@
 """SM70 sparse MLA for the NoPE 512-d latent.
 
-Fp16 query and KV, fp32 softmax. The bf16 Triton and TileLang DSA kernels
-do not run on Volta. The indexer has already chosen the keys; this kernel
-only attends to those rows.
+Fp16 query, fp16 or unscaled FP8 E4M3 KV, fp32 softmax. The bf16 Triton and
+TileLang DSA kernels do not run on Volta. The indexer has already chosen the
+keys; this kernel only attends to those rows.
 """
 
 from __future__ import annotations
@@ -31,14 +31,19 @@ def sparse_mla_sm70(
     """Sparse attention for one NoPE latent.
 
     ``q`` is ``[S, H, 512]`` fp16. ``kv`` is ``[N, 512]`` or ``[N, 1, 512]``
-    fp16, and ``indices`` is ``[S, topk]`` (or ``[S, 1, topk]``). Negative
+    fp16 or float8_e4m3fn (uint8 bytes are read as E4M3), and ``indices`` is ``[S, topk]`` (or ``[S, 1, topk]``). Negative
     indices are ignored. Returns ``[1, S, H, 512]`` fp16.
     """
     if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) != (7, 0):
         raise ValueError("sparse_mla_sm70 requires an SM70 CUDA device")
-    if q.dtype != torch.float16 or kv.dtype != torch.float16:
+    if q.dtype != torch.float16:
+        raise ValueError(f"SM70 sparse MLA requires fp16 q, got {q.dtype}")
+    if kv.dtype == torch.float8_e4m3fn:
+        # Unscaled E4M3 pool; the kernel reads it as bytes and widens to fp16.
+        kv = kv.view(torch.uint8)
+    elif kv.dtype not in (torch.float16, torch.uint8):
         raise ValueError(
-            f"SM70 sparse MLA requires fp16 q and kv, got {q.dtype} and {kv.dtype}"
+            f"SM70 sparse MLA requires fp16 or fp8_e4m3 kv, got {kv.dtype}"
         )
     if q.ndim != 3 or q.shape[-1] != 512:
         raise ValueError(f"q must be [S, H, 512], got {tuple(q.shape)}")

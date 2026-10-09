@@ -2684,6 +2684,18 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
+    # SM70 (SGLANG_SM70_DSA_FP8_KV): the Volta sparse MLA kernel reads unscaled
+    # E4M3 latent bytes and widens them to fp16 while staging, so the pool keeps
+    # the raw layout (no per-block scales); writes take the plain cast path.
+    if (
+        kv_cache_dtype == torch.float8_e4m3fn
+        and not _is_hip
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 7
+        and envs.SGLANG_SM70_DSA_FP8_KV.get()
+    ):
+        return kv_cache_dim
+
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout

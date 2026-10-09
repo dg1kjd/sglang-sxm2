@@ -683,6 +683,20 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "triton"
         if not user_set_decode:
             declared["dsa_decode_backend"] = "triton"
+    elif kv_cache_dtype == "fp8_e4m3" and major == 7:
+        # Volta: the SM70 sparse MLA kernel reads the FP8 pool directly and the
+        # attention dispatch short-circuits to it before any backend name is
+        # consulted. Keep the FP16 path's names so no FlashMLA metadata (and no
+        # flashmla_ops import) is reached during CUDA graph capture.
+        if not envs.SGLANG_SM70_DSA_FP8_KV.get():
+            raise ValueError(
+                "DSA fp8_e4m3 KV cache on SM70 needs SGLANG_SM70_DSA_FP8_KV=1 "
+                "(the Hopper flashmla_kv backend does not exist on Volta)."
+            )
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_sparse"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "fa3"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"

@@ -1452,6 +1452,11 @@ class Envs:
     SGLANG_SM70_GLM_NVFP4_GEMV = EnvBool(False)
     SGLANG_SM70_GLM_NVFP4_MOE_DECODE = EnvBool(False)
     SGLANG_SM70_GLM_NVFP4_BUILD_DIR = EnvStr("~/.cache/sglang/glm_nvfp4_gemv")
+    # DSA (GLM-5.3/DeepSeek sparse MLA) on Volta with --kv-cache-dtype fp8_e4m3:
+    # the latent is stored as unscaled E4M3 bytes and widened to fp16 while the
+    # SM70 sparse MLA kernel stages rows into shared memory. Off by default;
+    # without it fp8_e4m3 on SM70 is rejected at argument resolution.
+    SGLANG_SM70_DSA_FP8_KV = EnvBool(False)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)

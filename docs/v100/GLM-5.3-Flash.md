@@ -81,6 +81,39 @@ export GLM53_MODEL=~/models/GLM-5.3-Flash-NVFP4
 bash scripts/serve_glm53_flash_nvfp4_v100.sh
 ```
 
+### High-concurrency profile: four real decode requests
+
+On 8x V100-SXM2, the no-MTP profile below forms a real batch of four. The
+`--max-running-requests` value alone is not enough: the Mamba state pool caps
+admission at `max_mamba_cache_size // 5` in this path. Use 20 Mamba slots and
+capture graph batch sizes 1, 2, and 4 together.
+
+```bash
+export GLM53_MODEL=~/models/GLM-5.3-Flash-NVFP4
+export GLM53_MTP_STEPS=0
+export GLM53_KV_CACHE_DTYPE=fp8_e4m3
+export GLM53_CONTEXT_LENGTH=256000
+export GLM53_MEM_FRACTION=0.945
+export GLM53_MAX_RUNNING=4
+export GLM53_MAMBA_SLOTS=20
+export GLM53_CUDA_GRAPH_BS_DECODE="1 2 4"
+bash scripts/serve_glm53_flash_nvfp4_v100.sh
+```
+
+Measured on 8x Tesla V100-SXM2-32GB: four simultaneous requests, 256 completion
+tokens each, median aggregate throughput 250.5 tok/s over three rounds, with
+`#running-req: 4` and `cuda graph: True` in the scheduler log. The 256k value is
+the per-request maximum. Four requests near 240k each exceed the measured
+751,040-token FP8 KV pool, so long requests still queue or receive a context
+capacity error.
+
+The verified MTP=1 dual-request profile is a useful alternative when two active
+sessions matter more than four-way capacity: use `GLM53_MTP_STEPS=1`,
+`GLM53_MAX_RUNNING=2`, `GLM53_MAMBA_SLOTS=20`, and
+`GLM53_CUDA_GRAPH_BS_DECODE="1 2"`. On the same host it measured 188.5 tok/s
+aggregate. MTP 2 or 3 steps measured about 55-60 tok/s with two simultaneous
+requests, so the default MTP=3 profile is not the high-concurrency choice.
+
 Expanded (what that script runs with MTP). The env block is not implied by the CLI flags: it turns on the Volta decode kernels and the two-level all-reduce.
 
 ```bash
@@ -146,10 +179,10 @@ python -m sglang.launch_server \
 | MTP | on, 3 steps / 4 draft tokens | Fastest measured. On an earlier build 2 steps gave 117 tok/s against about 123 for 3; 4 steps (5-row verify) falls off the 4-row kernels and dropped to 34 |
 | draft experts | NVFP4 at load (`SGLANG_NVFP4_CKPT_NVFP4_NEXTN_MOE=1`) | Draft weights 2.4 → 1.06 GB per rank, which buys KV pool, and acceptance is the same as the BF16 draft |
 | `--ep-size` | 1 | Experts TP-sliced: every rank does the same MoE work per token. With EP=8 the other ranks waited for the one holding most routes |
-| `--max-running-requests` | 1 | The decode and verify kernels give each row the same result as batch 1 only while the whole launch has at most 4 rows (1 request × 4 draft tokens) |
+| `--max-running-requests` | 1 by default; 4 in the no-MTP profile | Four requests require the Mamba state pool and graph batch sizes to be raised together |
 | `--mem-fraction-static` | 0.935 | Leaves a 242,880-token KV pool. Without MTP use 0.88 (225,600-token pool) |
 | `--context-length` | 240,640 | Kept below the pool so prompt plus completion always fits. Without MTP use 223,232 |
-| `--max-mamba-cache-size` / `--mamba-max-states-per-path` | 12 / 2 | A running request pins 4 slots and admission wants 3 free. With 8 slots a subagent call evicted the main session's states, which cost a 100k+ re-prefill on the next main turn |
+| `--max-mamba-cache-size` / `--mamba-max-states-per-path` | 12 / 2 by default; 20 / 2 for real batch 4 | In the no-MTP path the scheduler caps requests at `max_mamba_cache_size // 5`; 12 therefore silently caps four-request settings at 2 |
 | prefill chunk | 2048 | The measured value. Larger chunks have not been tried with the memory a 0.935 pool leaves |
 | `--warmups prefix_reuse,sampling` | on | Loads the kernels of a cache hit and a grammar-constrained decode at startup, and builds FlashInfer's sampling module. Otherwise they load on the first real tool turn, when little memory is free, and the first sampled request waits for the build |
 | `--sleep-on-idle` | on | Without it the eight idle scheduler loops keep about 5 CPU cores busy. Decode speed is the same either way |
@@ -159,7 +192,7 @@ Without MTP (`GLM53_MTP_STEPS=0` in the wrapper): drop the five `--speculative-*
 
 ## Limitations
 
-- One request at a time. A second request queues behind the first.
+- The default recipe is one request at a time. Use the high-concurrency profile above for real batch-4 decode.
 - Text only (`--language-only`).
 - A fresh subagent conversation pays its own cold prefill (about 10 s at 20k tokens).
 - The first request with a new set of tools compiles its tool-call grammar, about 7 s once per tool set.
