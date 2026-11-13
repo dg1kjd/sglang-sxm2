@@ -86,6 +86,7 @@ class TestDsv41DsparkMarkovRemap(CustomTestCase):
                     SimpleNamespace(markov_head=object()), **kwargs
                 )
             ),
+            post_load_weights=lambda: None,
         )
         DeepseekV4ForCausalLMDSpark.load_weights(
             model,

@@ -21,7 +21,7 @@
 #   CUDAHOSTCXX        CUDA host compiler (default: auto-detect g++-12)
 #   MARLIN_V100_INSTALL_DIR install artifacts here instead of importing sglang
 #   MARLIN_V100_SKIP_SMOKE  set to 1 to validate in a later cached Docker layer
-#   MARLIN_V100_SKIP_BF16_COMPAT set to 1 with CUDA 12.8+ toolkit headers
+#   MARLIN_V100_SKIP_BF16_COMPAT 1 skips the bf16 compat patch (default: CUDA >= 12.8)
 #   MAX_JOBS, NVCC_THREADS  parallelism handed to the build
 
 set -euo pipefail
@@ -47,8 +47,19 @@ SM70_PATCHES=(
   "$PATCH_DIR/marlin-v100-qwen-sm70-tuning.patch"
   "$PATCH_DIR/marlin-v100-qwen38-nvfp4-tuning.patch"
 )
+# CUDA 12.8+ <cuda_bf16.hpp> defines the bf16x2 intrinsics on every arch, so the
+# compat shim would redefine them. Default: apply it only below 12.8 (the torch
+# CUDA version selects the toolkit below). 0/1 force it either way.
+if [[ -z "${MARLIN_V100_SKIP_BF16_COMPAT:-}" ]]; then
+  IFS=. read -r CUDA_MAJOR CUDA_MINOR _ <<<"$CUDA_VER"
+  if (( CUDA_MAJOR > 12 || (CUDA_MAJOR == 12 && CUDA_MINOR >= 8) )); then
+    MARLIN_V100_SKIP_BF16_COMPAT=1
+  fi
+fi
 if [[ "${MARLIN_V100_SKIP_BF16_COMPAT:-0}" != 1 ]]; then
   SM70_PATCHES+=("$PATCH_DIR/marlin-v100-sm70.patch")
+else
+  log "skipping marlin-v100-sm70.patch (CUDA ${CUDA_VER} headers have the bf16 intrinsics)"
 fi
 if [[ ! -d "$REPO/.git" ]]; then
   log "cloning marlin_v100 to $REPO"

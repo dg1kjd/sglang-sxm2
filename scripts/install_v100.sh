@@ -42,12 +42,14 @@ log "Installing host compiler and CUDA 12.8 prerequisites"
 "${SUDO[@]}" apt-get update
 "${SUDO[@]}" apt-get install -y \
   build-essential ca-certificates cmake curl git g++-12 g++-14 libnuma-dev \
-  ninja-build pkg-config wget
+  libssl-dev ninja-build pkg-config wget
 
 # SGLang's Rust extensions use edition 2024 (rustc 1.85+); distro cargo is often
 # older, so fall back to a user-local rustup toolchain.
 [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
-rust_minor="$(rustc --version 2>/dev/null | sed -n 's/^rustc 1\.\([0-9]*\).*/\1/p')"
+# Without rustc the probe fails (127); under set -e that would end the script
+# before the rustup fallback below.
+rust_minor="$(rustc --version 2>/dev/null | sed -n 's/^rustc 1\.\([0-9]*\).*/\1/p' || true)"
 if [[ -z "$rust_minor" ]] || (( rust_minor < 85 )); then
   log "Installing a Rust toolchain with rustup"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -181,6 +183,8 @@ prepare_sparse_repo() {
     die "$destination has local changes; move it aside or set SGLANG_V100_DEPS_DIR."
   fi
 
+  # Older git defaults to pattern mode, so ask for cone mode explicitly.
+  git -C "$destination" sparse-checkout init --cone
   git -C "$destination" sparse-checkout set "$@"
   if [[ "$(git -C "$destination" rev-parse HEAD 2>/dev/null || true)" != "$rev" ]]; then
     git -C "$destination" fetch origin "$rev"
@@ -203,10 +207,13 @@ python -m pip install --no-deps --no-build-isolation -e "$FLASHINFER_DIR"
 python -m pip uninstall -y flash-attn-v100 flash_attn_v100 || true
 
 TURBOMIND_SOURCE_DIR="$DEPS_ROOT/turbomind-sm70-source"
+# All of csrc (452 files, 6.3 MB): the gemm sources include
+# csrc/sm70_tile_runtime_signal.cuh, which a fresh clone with the
+# narrower csrc/core, csrc/sm70_turbomind, csrc/moe cone missed (issue #5).
 prepare_sparse_repo \
   "LMDeploy/1Cat TurboMind" https://github.com/1CatAI/1Cat-vLLM.git \
   "$TURBOMIND_SOURCE_REV" "$TURBOMIND_SOURCE_DIR" \
-  LICENSE csrc/core csrc/sm70_turbomind csrc/moe
+  LICENSE csrc
 
 TURBOMIND_CUTLASS_DIR="$DEPS_ROOT/cutlass-turbomind"
 prepare_patched_repo \
@@ -223,6 +230,21 @@ if [[ ! -d "$HOME/cutlass/.git" ]]; then
     https://github.com/NVIDIA/cutlass.git "$HOME/cutlass"
 fi
 export CUTLASS_DIR="$HOME/cutlass"
+
+# sglang-kernel's CMakeLists needs CMake >= 3.26; Ubuntu 22.04 ships 3.22.
+if ! python - <<'PY'
+import re, shutil, subprocess, sys
+
+cmake = shutil.which("cmake")
+out = subprocess.run([cmake, "--version"], capture_output=True, text=True).stdout if cmake else ""
+match = re.search(r"(\d+)\.(\d+)", out)
+sys.exit(0 if match and tuple(map(int, match.groups())) >= (3, 26) else 1)
+PY
+then
+  log "Installing CMake >= 3.26 into the sglang-v100 environment"
+  python -m pip install "cmake>=3.26"
+  hash -r
+fi
 
 log "Building lean SM70-only sglang-kernel"
 # Remove the newer-GPU wheel first so pip cannot leave an orphaned common_ops

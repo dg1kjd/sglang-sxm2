@@ -1,4 +1,4 @@
-"""CPU tests for one-slot exact token-id continuation on ChunkCache."""
+"""CPU tests for one-slot exact token-id continuation over a disabled radix cache."""
 
 from __future__ import annotations
 
@@ -59,6 +59,7 @@ class _FakeInnerCache:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = allocator
         self.page_size = page_size
+        self.logical_page_size = page_size
         self.disable = True
         self.finished = []
         self.matches = 0
@@ -70,7 +71,7 @@ class _FakeInnerCache:
     def match_prefix(self, params):
         self.matches += 1
         return MatchResult(
-            device_indices=torch.empty((0,), dtype=torch.int64),
+            device_prefix_len=0,
             last_device_node=None,
             last_host_node=None,
             best_match_node=None,
@@ -86,7 +87,7 @@ class _FakeInnerCache:
     def evict(self, params):
         return None
 
-    def evict_for_alloc(self, params):
+    def evict_for_alloc(self, params, *, allocation_reclaim_satisfied=None):
         return None
 
     def inc_lock_ref(self, node):
@@ -133,7 +134,7 @@ class _FakeReq:
         self.finished_len = None
         self.to_finish = None
         self.skip_radix_cache_insert = False
-        self.extend_range = None
+        self.extend_end = None
 
     def finished(self):
         return self.finished_reason is not None
@@ -149,9 +150,9 @@ class _FakeReq:
         return kv
 
 
-class _Range:
-    def __init__(self, end):
-        self.end = end
+def _prefix_row(pool, req, result):
+    """The prefix KV the scheduler takes for a hit: the request's own row."""
+    return pool.req_to_token[req.kv.req_pool_idx, : result.device_prefix_len].tolist()
 
 
 def _release(cache, req):
@@ -203,8 +204,8 @@ class TestStickyLastSequence(CustomTestCase):
             MatchPrefixParams(key=_key(last + [50, 51]), req=nxt)
         )
         self.assertEqual(inner.matches, 0)
-        self.assertEqual(len(result.device_indices), 10)
-        self.assertEqual(result.device_indices.tolist(), list(range(10)))
+        self.assertEqual(result.device_prefix_len, 10)
+        self.assertEqual(_prefix_row(pool, nxt, result), list(range(10)))
         self.assertEqual(nxt.kv.req_pool_idx, 0)
         self.assertEqual(result.cache_protected_len, 0)
 
@@ -221,7 +222,7 @@ class TestStickyLastSequence(CustomTestCase):
         result = cache.match_prefix(
             MatchPrefixParams(key=_key(last + [50, 51]), req=nxt)
         )
-        self.assertEqual(len(result.device_indices), 9)
+        self.assertEqual(result.device_prefix_len, 9)
 
     def test_pin_ignores_an_image_outside_the_output(self):
         # An image past the stop (overlap loop) or before the prompt end
@@ -240,7 +241,7 @@ class TestStickyLastSequence(CustomTestCase):
         result = cache.match_prefix(
             MatchPrefixParams(key=_key(list(range(8))), req=nxt)
         )
-        self.assertEqual(len(result.device_indices), 0)
+        self.assertEqual(result.device_prefix_len, 0)
         self.assertEqual(inner.matches, 1)
         self.assertIsNone(cache._last_ids)
         self.assertEqual(pool.free_slots, [0])
@@ -254,20 +255,20 @@ class TestStickyLastSequence(CustomTestCase):
         result = cache.match_prefix(
             MatchPrefixParams(key=_key(list(range(6)) + [99, 100]), req=nxt)
         )
-        self.assertEqual(len(result.device_indices), 0)
+        self.assertEqual(result.device_prefix_len, 0)
         self.assertEqual(inner.matches, 1)
         self.assertIsNone(cache._last_ids)
         self.assertEqual(cache._cuts, [])
 
     def test_recorded_stop_hits_a_shorter_shared_prefix(self):
-        cache, inner, _, _ = self._make(row_len=16)
+        cache, inner, _, pool = self._make(row_len=16)
         partial = _FakeReq(
             req_pool_idx=0,
             committed=8,
             allocated=8,
             origin=list(range(8)),
         )
-        partial.extend_range = _Range(8)
+        partial.extend_end = 8
         checkpoint_kv_cache(partial, cache)
         self.assertEqual(cache._cuts, [8])
         _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
@@ -279,8 +280,8 @@ class TestStickyLastSequence(CustomTestCase):
             MatchPrefixParams(key=_key(list(range(8)) + [99, 100]), req=nxt)
         )
         self.assertEqual(inner.matches, 0)
-        self.assertEqual(len(result.device_indices), 8)
-        self.assertEqual(result.device_indices.tolist(), list(range(8)))
+        self.assertEqual(result.device_prefix_len, 8)
+        self.assertEqual(_prefix_row(pool, nxt, result), list(range(8)))
         self.assertEqual(nxt.kv.req_pool_idx, 0)
         self.assertEqual(cache._last_ids, tuple(last[:8]))
         self.assertEqual(cache._cuts, [8])
@@ -295,17 +296,17 @@ class TestStickyLastSequence(CustomTestCase):
         cache, _, _, _ = self._make(row_len=64)
         first = list(range(8))
         prefill = _FakeReq(req_pool_idx=0, committed=8, allocated=8, origin=first)
-        prefill.extend_range = _Range(8)
+        prefill.extend_end = 8
         checkpoint_kv_cache(prefill, cache)
         self._pin(cache, origin=first, output=[8, 9])
 
         second = first + [40, 41, 42, 43]
         nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
         result = cache.match_prefix(MatchPrefixParams(key=_key(second), req=nxt))
-        self.assertEqual(len(result.device_indices), 8)
+        self.assertEqual(result.device_prefix_len, 8)
         nxt.origin_input_ids = second
         nxt.kv.kv_committed_len = nxt.kv.kv_allocated_len = len(second)
-        nxt.extend_range = _Range(len(second))
+        nxt.extend_end = len(second)
         checkpoint_kv_cache(nxt, cache)
         nxt.output_ids = [44, 45]
         nxt.kv.kv_committed_len = nxt.kv.kv_allocated_len = len(second) + 2
@@ -315,7 +316,7 @@ class TestStickyLastSequence(CustomTestCase):
         third = second + [50, 51]
         last = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
         result = cache.match_prefix(MatchPrefixParams(key=_key(third), req=last))
-        self.assertEqual(len(result.device_indices), len(second))
+        self.assertEqual(result.device_prefix_len, len(second))
 
     def test_unfinished_stop_is_extend_end_not_the_sampled_token(self):
         cache, _, _, _ = self._make()
@@ -328,7 +329,7 @@ class TestStickyLastSequence(CustomTestCase):
             origin=list(range(8)),
             output=[8],
         )
-        req.extend_range = _Range(8)
+        req.extend_end = 8
         checkpoint_kv_cache(req, cache)
         self.assertEqual(cache._cuts, [8])
 
@@ -340,7 +341,7 @@ class TestStickyLastSequence(CustomTestCase):
             allocated=4,
             origin=list(range(10)),
         )
-        req.extend_range = _Range(4)
+        req.extend_end = 4
         checkpoint_kv_cache(req, cache)
         self.assertEqual(cache._cuts, [4])
 
@@ -360,7 +361,7 @@ class TestStickyLastSequence(CustomTestCase):
         result = cache.match_prefix(
             MatchPrefixParams(key=_key([7] + list(range(1, 12))), req=nxt)
         )
-        self.assertEqual(len(result.device_indices), 0)
+        self.assertEqual(result.device_prefix_len, 0)
         self.assertEqual(inner.matches, 1)
 
     def test_miss_forgets_old_last_ids(self):
@@ -374,7 +375,7 @@ class TestStickyLastSequence(CustomTestCase):
         result = cache.match_prefix(
             MatchPrefixParams(key=_key(list(range(8)) + [8, 9, 50]), req=later)
         )
-        self.assertEqual(len(result.device_indices), 0)
+        self.assertEqual(result.device_prefix_len, 0)
         self.assertIsNone(later.kv.req_pool_idx)
 
     def test_extra_key_mismatch_misses(self):
@@ -385,7 +386,7 @@ class TestStickyLastSequence(CustomTestCase):
         result = cache.match_prefix(
             MatchPrefixParams(key=_key(last + [9], extra_key="lora-b"), req=nxt)
         )
-        self.assertEqual(len(result.device_indices), 0)
+        self.assertEqual(result.device_prefix_len, 0)
         self.assertEqual(inner.matches, 1)
 
     def test_abort_does_not_save(self):
@@ -409,9 +410,9 @@ class TestStickyLastSequence(CustomTestCase):
             allocated=12,
             origin=list(range(12)),
         )
-        req.extend_range = _Range(4)
+        req.extend_end = 4
         checkpoint_kv_cache(req, cache)
-        req.extend_range = _Range(8)
+        req.extend_end = 8
         checkpoint_kv_cache(req, cache)
         req.finished_reason = FINISH_ABORT("client")
         _release(cache, req)
@@ -427,21 +428,21 @@ class TestStickyLastSequence(CustomTestCase):
         result = cache.match_prefix(
             MatchPrefixParams(key=_key(list(range(12))), req=nxt)
         )
-        self.assertEqual(len(result.device_indices), 8)
-        self.assertEqual(result.device_indices.tolist(), list(range(8)))
+        self.assertEqual(result.device_prefix_len, 8)
+        self.assertEqual(_prefix_row(pool, nxt, result), list(range(8)))
         self.assertEqual(inner.matches, 0)
 
         other = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
         missed = cache.match_prefix(
             MatchPrefixParams(key=_key([99, 100, 101]), req=other)
         )
-        self.assertEqual(len(missed.device_indices), 0)
+        self.assertEqual(missed.device_prefix_len, 0)
         self.assertIsNone(cache._last_ids)
         self.assertEqual(inner.matches, 1)
 
     def test_abort_pins_unstashed_extend_end(self):
         # The chunk that just finished is snapshotted in the worker before
-        # stash, so the abort has to pin extend_range.end on its own.
+        # stash, so the abort has to pin extend_end on its own.
         cache, inner, _, _ = self._make(row_len=16)
         req = _FakeReq(
             req_pool_idx=0,
@@ -449,7 +450,7 @@ class TestStickyLastSequence(CustomTestCase):
             allocated=8,
             origin=list(range(12)),
         )
-        req.extend_range = _Range(8)
+        req.extend_end = 8
         req.finished_reason = FINISH_ABORT("client")
         _release(cache, req)
         self.assertEqual(cache._last_ids, tuple(range(8)))
@@ -458,7 +459,7 @@ class TestStickyLastSequence(CustomTestCase):
         result = cache.match_prefix(
             MatchPrefixParams(key=_key(list(range(12))), req=nxt)
         )
-        self.assertEqual(len(result.device_indices), 8)
+        self.assertEqual(result.device_prefix_len, 8)
 
     def test_reset_frees_pin(self):
         cache, inner, allocator, pool = self._make()
@@ -495,22 +496,124 @@ class TestStickyLastSequence(CustomTestCase):
         cache.match_prefix(MatchPrefixParams(key=_key(last + [6]), req=nxt))
         self.assertIs(nxt.kv, kv)
 
-    def test_health_check_miss_does_not_drop_pin(self):
-        cache, inner, allocator, pool = self._make()
-        _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
-        nxt = _FakeReq(
+    def _health_req(self):
+        return _FakeReq(
             req_pool_idx=None,
             committed=0,
             allocated=0,
             origin=[],
             rid="HEALTH_CHECK_abc",
         )
-        result = cache.match_prefix(MatchPrefixParams(key=_key([0]), req=nxt))
-        self.assertEqual(len(result.device_indices), 0)
+
+    def test_health_check_drops_the_pin_without_a_session_store(self):
+        # The dummy forward starts at 0 and clears the CSA2 boundary store; a
+        # pin kept past it made the next exact turn resume past the image.
+        cache, inner, allocator, pool = self._make()
+        self._pin(cache, origin=list(range(8)), output=[8, 9])
+        result = cache.match_prefix(
+            MatchPrefixParams(key=_key([0]), req=self._health_req())
+        )
+        self.assertEqual(result.device_prefix_len, 0)
         self.assertEqual(inner.matches, 1)
+        self.assertIsNone(cache._last_ids)
+        self.assertEqual(pool.free_slots, [0])
+        self.assertTrue(allocator.freed)
+
+    def _with_session_store(self):
+        import tempfile
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import reset_handoff
+
+        envs.SGLANG_DSV41_CSA2_SESSION_DIR.set(tempfile.mkdtemp())
+        reset_handoff()
+
+        def restore():
+            envs.SGLANG_DSV41_CSA2_SESSION_DIR.clear()
+            reset_handoff()
+
+        self.addCleanup(restore)
+
+    def test_health_check_parks_the_pin_and_the_next_hit_loads_it(self):
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            load_meta,
+            session_key,
+            take_handoff,
+        )
+
+        self._with_session_store()
+        cache, inner, allocator, pool = self._make()
+        _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
+        key = session_key(last, None, None)
+
+        result = cache.match_prefix(
+            MatchPrefixParams(key=_key([0]), req=self._health_req())
+        )
+        self.assertEqual(result.device_prefix_len, 0)
         self.assertEqual(cache._last_ids, tuple(last))
         self.assertEqual(pool.free_slots, [])
         self.assertFalse(allocator.freed)
+        self.assertEqual(take_handoff(), (key, None))
+        self.assertEqual(load_meta(key)["ids"], last)
+        # A second probe must not spill again: the store now holds the dummy.
+        cache.match_prefix(MatchPrefixParams(key=_key([0]), req=self._health_req()))
+        self.assertEqual(take_handoff(), (None, None))
+        probes = inner.matches
+
+        second = last + [20, 21]
+        nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=second)
+        result = cache.match_prefix(MatchPrefixParams(key=_key(second), req=nxt))
+        self.assertEqual(result.device_prefix_len, 10)
+        self.assertEqual(inner.matches, probes)
+        self.assertEqual(take_handoff(), (None, key))
+
+        # Once a request ran on the pin, the store holds its image again.
+        nxt.output_ids = [22, 23]
+        nxt.kv.kv_committed_len = 14
+        nxt.kv.kv_allocated_len = 14
+        nxt.finished_reason = FINISH_LENGTH(2)
+        _release(cache, nxt)
+        self.assertIsNone(cache._parked)
+        third = second + [22, 23, 24]
+        after = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=third)
+        result = cache.match_prefix(MatchPrefixParams(key=_key(third), req=after))
+        self.assertEqual(result.device_prefix_len, len(cache._last_ids))
+        self.assertGreater(result.device_prefix_len, 10)
+        self.assertEqual(take_handoff(), (None, None))
+
+    def test_parked_pin_stays_parked_when_its_hit_aborts_before_the_load(self):
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            session_key,
+            take_handoff,
+        )
+
+        self._with_session_store()
+        cache, inner, _, _ = self._make()
+        _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
+        key = session_key(last, None, None)
+        cache.match_prefix(MatchPrefixParams(key=_key([0]), req=self._health_req()))
+        self.assertEqual(take_handoff(), (key, None))
+
+        second = last + [20, 21]
+        nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=second)
+        cache.match_prefix(MatchPrefixParams(key=_key(second), req=nxt))
+        # Aborted in the waiting queue: the worker never took the load.
+        nxt.finished_reason = FINISH_ABORT("client")
+        _release(cache, nxt)
+        self.assertEqual(cache._parked, key)
+        self.assertEqual(cache._last_ids, tuple(last))
+
+        # A different conversation misses: it must not spill the dummy's image
+        # over the parked file.
+        other = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        missed = cache.match_prefix(
+            MatchPrefixParams(key=_key([99, 100, 101]), req=other)
+        )
+        self.assertEqual(missed.device_prefix_len, 0)
+        spill, _load = take_handoff()
+        self.assertIsNone(spill)
+        self.assertIsNone(cache._last_ids)
+        self.assertIsNone(cache._parked)
 
     def test_health_check_finish_does_not_pin(self):
         cache, inner, _, _ = self._make()
@@ -594,7 +697,7 @@ class TestStickyLastSequence(CustomTestCase):
                 MatchPrefixParams(key=_key(ids + [20, 21]), req=nxt)
             )
             self.assertEqual(inner.matches, 0)
-            self.assertEqual(len(result.device_indices), 6)
+            self.assertEqual(result.device_prefix_len, 6)
             self.assertEqual(nxt.kv.req_pool_idx, 1)
             spill, load = take_handoff()
             self.assertIsNone(spill)

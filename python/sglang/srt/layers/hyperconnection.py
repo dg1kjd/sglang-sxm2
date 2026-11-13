@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Optional
 
 import msgspec
@@ -12,6 +13,16 @@ from sglang.kernels.ops.gemm.hc_mix import (
     sm70_hc_down_gemv_silu_supported,
     sm70_hc_up_gemv_reduce,
 )
+from sglang.srt.layers.hc_mix_flydsl import (
+    flydsl_hc_mix_supported,
+    flydsl_hc_mix_weights_supported,
+    weight_cache_key,
+)
+
+
+@lru_cache(None)
+def _hc_gate_stream(device: int) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device=device)
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -168,10 +179,13 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+            # Resolved on the first mix(), once the weights are final.
+            self._mix_flydsl_ok = None
+            self._mix_flydsl_weights = None
+            self._mix_flydsl_weight_key = None
 
         self._split_combine_ok = False
-        # SM70: (normed, gate partials) from the last mix, for its combine.
-        self._pending_gate = None
+        self._gate_stream = None
         if use_combine:
             self.block_inject_weight = nn.Linear(
                 self.hidden_size * self.hc_count,
@@ -195,6 +209,16 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            if (
+                self.hc_count == 4
+                and self.hidden_size == 2560
+                and config.hc_per_branch_norm
+                and config.params_dtype == torch.bfloat16
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] == 10
+            ):
+                # Create before graph capture; all layers on a device share it.
+                self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -234,16 +258,32 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
-    def mix(self, hyper_input: torch.Tensor):
+    def _flydsl_mix_ok(self) -> bool:
+        if self._mix_flydsl_ok is None:
+            self._mix_flydsl_ok = flydsl_hc_mix_weights_supported(
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+            )
+        return self._mix_flydsl_ok
+
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        normalized_input: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
-            self._pending_gate = None
-            return mixed_input, (hyper_input, hyper_input)
+            return mixed_input, (hyper_input, hyper_input, None)
 
-        if self.config.hc_per_branch_norm:
+        if normalized_input is not None:
+            assert self.config.hc_per_branch_norm
+            assert normalized_input.shape == hyper_input.shape
+            hyper_input_normed = normalized_input
+        elif self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
         else:
             hyper_input_normed = self.hc_norm(
@@ -287,7 +327,7 @@ class GatedResidual(HyperConnectionBase):
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
         ):
-            from sglang.srt.layers.elementwise.hc_mix import (
+            from sglang.kernels.ops.gemm.hc_mix_splitk import (
                 hc_mix,
                 permute_pad_up_weight,
             )
@@ -303,6 +343,18 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
+        elif flydsl_hc_mix_supported(hyper_input_normed, self._flydsl_mix_ok()):
+            from aiter.ops.flydsl.hc_mix import hc_mix, pack_hc_weights
+
+            down = self.input_mix_weight_down.weight
+            up = self.input_mix_weight_up.weight
+            key = weight_cache_key(down, up)
+            if self._mix_flydsl_weight_key != key:
+                self._mix_flydsl_weights = pack_hc_weights(down, up, self.hc_count)
+                self._mix_flydsl_weight_key = key
+            mixed_input = hc_mix(hyper_input_normed, *self._mix_flydsl_weights).to(
+                self.params_dtype
+            )
         elif fused_hc_mix_supported(
             hyper_input_normed,
             self.input_mix_weight_down.weight,
@@ -323,22 +375,82 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        # GatedResidualState carries only (residual, normed) from a read to its
-        # write-back, so the gate partials wait here, keyed by that normed.
-        self._pending_gate = (
-            None if gate_partials is None else (hyper_input_normed, gate_partials)
-        )
-        return mixed_input, (hyper_input, hyper_input_normed)
+        # SM70 gate partials come from hc_down_with_gate above; they follow the
+        # residual rows in slot 3 like upstream's, but need no stream wait.
+        partials = gate_partials
+        stream = self._gate_stream
+        if (
+            partials is None
+            and stream is not None
+            and hyper_input.shape[0] == 1
+            and hyper_input.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
 
-    def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
-        hyper_input, hyper_input_normed = residuals
-        pending, self._pending_gate = self._pending_gate, None
-        # A normed sliced or swapped since the mix falls through to the
-        # general path, which recomputes the gate from it.
-        if pending is not None and pending[0] is hyper_input_normed:
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                partials = hc_combine_gate(
+                    hyper_input_normed, self.block_inject_weight.weight
+                )
+            hyper_input_normed.record_stream(stream)
+        return mixed_input, (hyper_input, hyper_input_normed, partials)
+
+    def combine_and_normalize(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: Optional[GroupedGemmaRMSNorm],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return the residual and its next HC normalization explicitly.
+
+        The BF16 combine result is retained before calculating the next norm.
+        Callers must only pass the norm when no PLE or other update intervenes.
+        """
+        hyper_input, _, partials = residuals
+        if (
+            partials is not None
+            and self._gate_stream is not None
+            and next_norm is not None
+            and next_norm.group_size == self.hidden_size
+            and next_norm.weight.dtype == torch.bfloat16
+            and block_output.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                hc_combine_apply_norm,
+            )
+
+            current = torch.cuda.current_stream()
+            current.wait_stream(self._gate_stream)
+            partials.record_stream(current)
+            return hc_combine_apply_norm(
+                block_output,
+                hyper_input,
+                partials,
+                next_norm.weight,
+                next_norm.variance_epsilon,
+            )
+        return self.combine(block_output, residuals), None
+
+    def combine(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        hyper_input, hyper_input_normed, partials = residuals
+        if partials is not None and self._gate_stream is None:
             from sglang.kernels.ops.elementwise.sm70_hc_mix import hc_apply_gate
 
-            return hc_apply_gate(block_output, hyper_input, pending[1])
+            return hc_apply_gate(block_output, hyper_input, partials)
+        if partials is not None:
+            from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                hc_combine_apply,
+            )
+
+            current = torch.cuda.current_stream()
+            current.wait_stream(self._gate_stream)
+            partials.record_stream(current)
+            return hc_combine_apply(block_output, hyper_input, partials)
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
         if block_output.shape[0] == 0:
@@ -353,7 +465,7 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
             if self._split_combine_ok and block_output.shape[0] <= 32:
-                from sglang.srt.layers.elementwise.hc_combine import (
+                from sglang.kernels.ops.elementwise.hc_combine import (
                     hc_combine_split,
                 )
 
@@ -365,7 +477,7 @@ class GatedResidual(HyperConnectionBase):
                     self.hc_count,
                     self.hidden_size,
                 )
-            from sglang.srt.layers.elementwise.hc_combine import hc_combine
+            from sglang.kernels.ops.elementwise.hc_combine import hc_combine
 
             return hc_combine(
                 block_output,

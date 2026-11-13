@@ -8,9 +8,11 @@ only consumes ``mtp.*``.
 
 ``DSV4CheckpointReader`` returns None for a tensor the rank will not copy, and
 returns an already-sliced Engram shard so ``EngramEmbedding._load_rows`` does
-not need the full table. It records which expert ids it yielded. ``finish``
-raises if an id this rank owns never appeared, so a bad filter fails the load
-instead of leaving an expert at its empty init value.
+not need the full table. The model passes each table's row range, taken from
+its ``EngramEmbedding``, so the reader never computes a split of its own. It
+records which expert ids and Engram tables it yielded. ``finish`` raises if an
+id this rank owns or a table it has a range for never appeared, so a bad filter
+fails the load instead of leaving a weight at its empty init value.
 """
 
 from __future__ import annotations
@@ -18,11 +20,9 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from typing import FrozenSet, Optional
+from typing import FrozenSet, Mapping, Optional
 
 import torch
-
-from sglang.srt.layers.engram import engram_shard_rows
 
 logger = logging.getLogger(__name__)
 
@@ -82,28 +82,35 @@ def owned_expert_ids_from_physical_map(
     return owned
 
 
+def engram_table_prefix(name: str) -> str:
+    """``layers.N.engram.embed.weight`` -> ``layers.N.engram.embed.``"""
+    return name[: name.rindex(".") + 1]
+
+
 class DSV4CheckpointReader:
-    """Callable ``(name, safe_open_handle) -> tensor or None``."""
+    """Callable ``(name, safe_open_handle) -> tensor or None``.
+
+    ``engram_rows`` maps an Engram table's checkpoint prefix
+    (``layers.N.engram.embed.``) to this rank's ``[start, end)`` rows; None
+    reads the tables whole.
+    """
 
     def __init__(
         self,
         *,
         owned_expert_ids: Optional[FrozenSet[int]],
         n_routed: int,
-        tp_rank: int,
-        tp_size: int,
         mtp_only: bool,
-        narrow_engram: bool,
+        engram_rows: Optional[Mapping[str, tuple[int, int]]],
     ) -> None:
         self.owned_expert_ids = owned_expert_ids
         self.n_routed = int(n_routed)
-        self.tp_rank = int(tp_rank)
-        self.tp_size = int(tp_size)
         self.mtp_only = bool(mtp_only)
-        self.narrow_engram = bool(narrow_engram)
+        self.engram_rows = None if engram_rows is None else dict(engram_rows)
         self.read = 0
         self.skipped = 0
         self.expert_ids_read: set[int] = set()
+        self.engram_tables_read: set[str] = set()
         self._lock = threading.Lock()
 
     def __call__(self, name: str, handle) -> Optional[torch.Tensor]:
@@ -121,14 +128,15 @@ class DSV4CheckpointReader:
             with self._lock:
                 self.skipped += 1
             return None
-        if (
-            self.narrow_engram
-            and self.tp_size > 1
-            and is_engram_embed_table(name)
-        ):
+        engram_prefix = None
+        if self.engram_rows is not None and is_engram_embed_table(name):
+            engram_prefix = engram_table_prefix(name)
+            if engram_prefix not in self.engram_rows:
+                raise RuntimeError(
+                    f"DSV4 checkpoint read: no Engram row range for {name}"
+                )
+            row_start, row_end = self.engram_rows[engram_prefix]
             view = handle.get_slice(name)
-            num_rows = int(view.get_shape()[0])
-            row_start, row_end = engram_shard_rows(num_rows, self.tp_rank, self.tp_size)
             # A row slice is a view onto the mmap: its storage size is the
             # whole table, but reads and copy_ touch only these rows, and the
             # view stays valid after safe_open returns. Do not clone. Each
@@ -142,12 +150,16 @@ class DSV4CheckpointReader:
             self.read += 1
             if expert_id is not None and expert_id < self.n_routed:
                 self.expert_ids_read.add(expert_id)
+            if engram_prefix is not None:
+                self.engram_tables_read.add(engram_prefix)
         return tensor
 
     def finish(self) -> None:
         """Call after the weight iterator is exhausted."""
         owned = self.owned_expert_ids
         missing = () if owned is None else tuple(sorted(owned - self.expert_ids_read))
+        engram = self.engram_rows or {}
+        missing_engram = sorted(set(engram) - self.engram_tables_read)
         logger.info(
             "DSV4 checkpoint read: kept=%d skipped=%d owned_experts=%s missing=%d mtp_only=%s narrow_engram=%s",
             self.read,
@@ -155,7 +167,7 @@ class DSV4CheckpointReader:
             0 if owned is None else len(owned),
             len(missing),
             self.mtp_only,
-            self.narrow_engram,
+            self.engram_rows is not None,
         )
         if missing:
             preview = ", ".join(str(i) for i in missing[:8])
@@ -163,13 +175,19 @@ class DSV4CheckpointReader:
                 "DSV4 checkpoint read never yielded expert id(s) this rank "
                 f"owns ({preview}). Refusing to serve with an uninitialized expert."
             )
+        if missing_engram:
+            raise RuntimeError(
+                "DSV4 checkpoint read never yielded the Engram table(s) "
+                f"{', '.join(missing_engram)}. Refusing to serve with an "
+                "uninitialized table."
+            )
 
 
 def make_dsv4_checkpoint_reader(
     *,
     n_routed_experts: int,
     mtp_only: bool,
-    narrow_engram: bool,
+    engram_rows: Optional[Mapping[str, tuple[int, int]]],
     use_expert_location_metadata: bool,
 ) -> DSV4CheckpointReader:
     """Build the reader from the current parallel group and, for the target, EPLB metadata."""
@@ -222,8 +240,6 @@ def make_dsv4_checkpoint_reader(
     return DSV4CheckpointReader(
         owned_expert_ids=owned,
         n_routed=n_routed,
-        tp_rank=int(parallel.tp_rank),
-        tp_size=int(parallel.tp_size),
         mtp_only=mtp_only,
-        narrow_engram=narrow_engram,
+        engram_rows=engram_rows,
     )

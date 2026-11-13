@@ -29,10 +29,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fp8_sm70 import fp8_sm70_to_fp32
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    get_device_core_count,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
@@ -46,6 +46,15 @@ logger = logging.getLogger(__name__)
 
 
 _MIN_BLOCK_KV = 32
+
+
+def _rotate_batch(batch: int, uneven_batch: Optional[torch.Tensor]) -> bool:
+    # HIP hands workgroups to XCDs round-robin. With batch as the fastest grid axis,
+    # an even batch keeps each request on a subset of XCDs, so a long request or
+    # CUDA-graph padding rows leave the other XCDs idle. A balanced batch is already
+    # spread evenly, so the kernels only rotate while uneven_batch holds 1.
+    return _is_hip and batch % 2 == 0 and uneven_batch is not None
+
 
 # heads per stage-1 tile, shared so the budget's head_tiles cannot drift from the launch
 _GROUPED_BLOCK_H = 16
@@ -79,12 +88,11 @@ _MLA_BUCKETS = (
 )
 
 # For the paths that must not depend on the batch; the mid bucket sits between the
-# other two geometries. Retuning it moves what deterministic inference produces, which
-# test_batch_free_geometry_is_pinned guards. max_splits goes unused there.
+# other two geometries. Retuning it moves what deterministic inference produces;
+# max_splits goes unused there.
 _MLA_BUCKET_BATCH_FREE = _MLA_BUCKETS[1]
 
 _KEEP_SCHEDULER_SPLITS = None
-_CORE_COUNT = {}
 _LOGGED_TUNE = False
 
 
@@ -130,14 +138,6 @@ def _mla_split_budget(num_warps: int, core_count: int) -> int:
     # halving the warps to double how many fit. core_count, not a whole MI355X: a CPX
     # partition exposes 32 of the 256
     return core_count * 4 // num_warps
-
-
-def _mla_core_count(device_index: Optional[int]) -> int:
-    count = _CORE_COUNT.get(device_index)
-    if count is None:
-        count = get_device_core_count(device_index if device_index is not None else 0)
-        _CORE_COUNT[device_index] = count
-    return count
 
 
 def _mla_kv_splits(
@@ -188,7 +188,7 @@ def _mla_launch_plan(
     head_num = q.shape[1]
     head_tiles = _grouped_head_tiles(head_num, head_num // k_buffer.shape[-2])
     splits = _mla_kv_splits(
-        q.shape[0], head_tiles, max_kv_splits, _mla_core_count(q.device.index)
+        q.shape[0], head_tiles, max_kv_splits, current_arch().num_sms
     )
 
     global _LOGGED_TUNE
@@ -280,12 +280,18 @@ def _fwd_kernel_stage1(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    uneven_batch=None,
+    ROTATE_BATCH: tl.constexpr = False,
 ):
-    # int64 to avoid overflow of flat offsets into Mid_O when
-    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
-    cur_batch = tl.program_id(0).to(tl.int64)
+    cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
+    if ROTATE_BATCH:
+        if tl.load(uneven_batch) != 0:
+            cur_batch = (cur_batch + cur_head + split_kv_id) % tl.num_programs(0)
+    # int64 to avoid overflow of flat offsets into Mid_O when
+    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
+    cur_batch = cur_batch.to(tl.int64)
 
     cur_kv_head = cur_head // kv_group_num
 
@@ -452,6 +458,7 @@ def _decode_att_m_fwd(
     aux_tensors=None,
     sm70_fp8_kv=False,
     sm70_fp8_e5m2=False,
+    uneven_batch=None,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -531,6 +538,8 @@ def _decode_att_m_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        uneven_batch=uneven_batch,
+        ROTATE_BATCH=_rotate_batch(batch, uneven_batch),
     )
 
 
@@ -584,13 +593,21 @@ def _fwd_grouped_kernel_stage1(
     aux0_len=0,
     forced_kv_splits=0,
     USE_FORCED: tl.constexpr = False,
+    uneven_batch=None,
+    ROTATE_BATCH: tl.constexpr = False,
 ):
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+    if ROTATE_BATCH:
+        # Only the split rotates: the head tiles of one (request, split) read the same
+        # kv_indices (and the same latent KV under MLA), so they stay on one XCD.
+        if tl.load(uneven_batch) != 0:
+            cur_batch = (cur_batch + split_kv_id) % tl.num_programs(0)
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
-    cur_batch = tl.program_id(0).to(tl.int64)
-    cur_head_id = tl.program_id(1)
+    cur_batch = cur_batch.to(tl.int64)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
-    split_kv_id = tl.program_id(2)
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -826,6 +843,7 @@ def _decode_grouped_att_m_fwd(
     forced_kv_splits: int = 0,
     sm70_fp8_kv=False,
     sm70_fp8_e5m2=False,
+    uneven_batch=None,
 ):
     # Volta wants a 16-wide KV tile here: 32 overflows the 96KB smem budget
     # once the fp8 decode expands each tile to fp16.
@@ -941,6 +959,8 @@ def _decode_grouped_att_m_fwd(
         aux0_len=aux0_len,
         forced_kv_splits=forced_kv_splits,
         USE_FORCED=forced_kv_splits > 0,
+        uneven_batch=uneven_batch,
+        ROTATE_BATCH=_rotate_batch(batch, uneven_batch),
         **extra_kargs,
     )
 
@@ -1108,6 +1128,7 @@ def decode_attention_fwd_normal(
     aux_tensors=None,
     sm70_fp8_kv=False,
     sm70_fp8_e5m2=False,
+    uneven_batch=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -1127,6 +1148,7 @@ def decode_attention_fwd_normal(
         aux_tensors=aux_tensors,
         sm70_fp8_kv=sm70_fp8_kv,
         sm70_fp8_e5m2=sm70_fp8_e5m2,
+        uneven_batch=uneven_batch,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1165,6 +1187,7 @@ def decode_attention_fwd_grouped(
     aux_tensors=None,
     sm70_fp8_kv=False,
     sm70_fp8_e5m2=False,
+    uneven_batch=None,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1189,6 +1212,7 @@ def decode_attention_fwd_grouped(
         forced_kv_splits=forced_kv_splits,
         sm70_fp8_kv=sm70_fp8_kv,
         sm70_fp8_e5m2=sm70_fp8_e5m2,
+        uneven_batch=uneven_batch,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1233,6 +1257,7 @@ def decode_attention_fwd(
     lean_Lp=None,
     lean_Op=None,
     lean_locks=None,
+    uneven_batch=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -1310,6 +1335,7 @@ def decode_attention_fwd(
             aux_tensors=aux_tensors,
             sm70_fp8_kv=sm70_fp8_kv,
             sm70_fp8_e5m2=sm70_fp8_e5m2,
+            uneven_batch=uneven_batch,
         )
     else:
         # GQA/MQA/MLA
@@ -1336,6 +1362,7 @@ def decode_attention_fwd(
             aux_tensors=aux_tensors,
             sm70_fp8_kv=sm70_fp8_kv,
             sm70_fp8_e5m2=sm70_fp8_e5m2,
+            uneven_batch=uneven_batch,
         )
 
 
@@ -1371,7 +1398,7 @@ def _lean_num_cus() -> int:
     global _NUM_CU
     if _NUM_CU is None:
         try:
-            _NUM_CU = torch.cuda.get_device_properties(0).multi_processor_count
+            _NUM_CU = current_arch().num_sms
         except Exception:
             _NUM_CU = 304
     return _NUM_CU

@@ -85,12 +85,39 @@ export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${SGLANG_HICACHE_FILE_BACKEND_ST
 # A file removed behind its back ends that prefetch early (the rest is
 # recomputed); it never yields wrong data.
 export SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE="${SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE:-1}"
+# The file tier has no size limit of its own and long prompts add gigabytes
+# to it. Two limits; when either trips, the least recently used pages are
+# deleted first. "0" turns a limit off.
+# - MAX_SIZE caps the pages of each TP rank (every rank keeps its own pages), so
+#   the directory holds up to 4 x this, 150 GB. Once a rank reaches it, it
+#   trims to 90% (EVICTION_RATIO). With only the free-space floor, the tier
+#   filled the disk down to that floor (277 GB on a 2 TB disk).
+# - MIN_FREE_SPACE keeps this much of the filesystem free, for when models or
+#   other trees on the same disk grow.
+export SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE="${SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE:-37.5G}"
+export SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE="${SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE:-64G}"
+# The file tier outlives the engine, and it takes any stored page of the right
+# size as valid. When a fix changes what a correct page holds, raise
+# HICACHE_PAGE_EPOCH: this model's pages written under another epoch are then
+# removed once, at the next launch, and recomputed on demand.
+#   2 (2026-11): QSA pending-ring fix. With MTP on, earlier trees could store
+#     wrong compressed index keys for decoded tokens.
+SERVED_NAME=qwen38next-nvfp4
+HICACHE_PAGE_EPOCH=2
+_page_dir="$SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
+_epoch_file="$_page_dir/.$SERVED_NAME.page-epoch"
+mkdir -p "$_page_dir"
+if [[ "$(cat "$_epoch_file" 2>/dev/null || true)" != "$HICACHE_PAGE_EPOCH" ]]; then
+  _removed=$(find "$_page_dir" -maxdepth 1 -type f -name "*_${SERVED_NAME}_*.bin" -print -delete | wc -l)
+  (( _removed == 0 )) || echo "HiCache file tier: removed $_removed files written before page epoch $HICACHE_PAGE_EPOCH from $_page_dir" >&2
+  echo "$HICACHE_PAGE_EPOCH" > "$_epoch_file"
+fi
 
 # Docker-v2 tested sizing (README: 4 live requests, full 262K context)
 args=(
   --trust-remote-code
   --model-path "$MODEL"
-  --served-model-name qwen38next-nvfp4
+  --served-model-name "$SERVED_NAME"
   --dtype float16
   --quantization modelopt_fp4
   --reasoning-parser auto

@@ -1,9 +1,7 @@
 # Adapted from the DeepSeek-V4.1 release reference implementation.
 """Encode DeepSeek-V4.1 chat messages.
 
-Supports tool calls, reasoning effort, quick instruction tasks and image content.
-Mid-conversation system messages trigger the assistant generation header;
-image records are returned alongside the encoded prompt.
+Mid-conversation system messages trigger the assistant generation header.
 """
 
 import copy
@@ -108,7 +106,6 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
 
 
 def to_json(value: Any) -> str:
-    """Serialize a value to JSON string."""
     try:
         return json.dumps(value, ensure_ascii=False)
     except:
@@ -116,12 +113,10 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    """Extract function definitions from OpenAI-format tool list."""
     return [tool["function"] for tool in tools]
 
 
 def tool_calls_from_openai_format(tool_calls):
-    """Convert OpenAI-format tool calls to internal format."""
     return [
         {
             "name": tool_call["function"]["name"],
@@ -132,7 +127,6 @@ def tool_calls_from_openai_format(tool_calls):
 
 
 def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
-    """Encode tool call arguments into V4.1 DSML parameter format."""
     p_dsml_template = (
         '<{dsml_token}{tool_parameter_tag_name} name="{key}" string="{is_str}">'
         "{value}</{dsml_token}{tool_parameter_tag_name}>"
@@ -163,7 +157,6 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
 
 
 def render_tools(tools: List[Dict[str, Union[str, Dict[str, Any]]]]) -> str:
-    """Render tool schemas into the V4.1 system prompt format."""
     tools_json = [to_json(t) for t in tools]
 
     return TOOLS_TEMPLATE.format(
@@ -203,11 +196,18 @@ def render_reasoning_effort(
 def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     """Mid-conversation system messages also count as user messages here;
     they trigger the assistant generation header.
+    User messages containing only tool results do not start a new turn.
     """
     last_user_index = -1
     for idx in range(len(messages) - 1, -1, -1):
         role = messages[idx].get("role")
         if role in ["user", "developer"] or (role == "system" and idx > 0):
+            content_blocks = messages[idx].get("content_blocks")
+            if content_blocks and not any(
+                block.get("type") in ("text", "image", "image_url")
+                for block in content_blocks
+            ):
+                continue
             last_user_index = idx
             break
     return last_user_index
@@ -235,7 +235,6 @@ def render_message(
     drop_thinking: bool = True,
     reasoning_effort: Union[str, int, None] = None,
 ) -> str:
-    """Render the message at `index` into its DeepSeek-V4.1 encoded string form."""
     assert 0 <= index < len(messages)
     assert thinking_mode in [
         "chat",
@@ -261,8 +260,7 @@ def render_message(
     reasoning_effort_prompt = render_reasoning_effort(
         index, thinking_mode, reasoning_effort
     )
-    # The leading system token is emitted whenever there is something to host
-    # at index 0: a system message or the effort prompt (even before a user).
+    # Index 0 also emits the system token for the effort prompt, even before a user.
     prompt = (
         SYSTEM_SP_TOKEN
         if index == 0 and (reasoning_effort_prompt or role == "system")
@@ -443,10 +441,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         if role == "tool":
             # Convert tool message to a user message with tool_result block
+            content = msg.get("content", "")
+            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
+                content = msg["content_blocks"]
             tool_block = {
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id", ""),
-                "content": msg.get("content", ""),
+                "content": content,
             }
             # Merge into previous message if it's already a user (merged tool)
             if (
@@ -465,7 +466,12 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif role == "user":
             content_blocks = msg.get("content_blocks")
             if content_blocks is None:
-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
+                content = msg.get("content", "")
+                content_blocks = (
+                    content
+                    if isinstance(content, list)
+                    else [{"type": "text", "text": content}]
+                )
             if (
                 merged
                 and merged[-1].get("role") == "user"
@@ -487,10 +493,6 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def sort_tool_results_by_call_order(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Sort tool_result blocks within user messages by the order of tool_calls
-    in the preceding assistant message.
-    """
     last_tool_call_order: Dict[str, int] = {}
 
     for msg in messages:
@@ -530,31 +532,20 @@ def sort_tool_results_by_call_order(
 
 
 def _is_image_block(block: Dict[str, Any]) -> bool:
-    return isinstance(block, dict) and block.get("type") in ("image", "image_url")
+    return isinstance(block, dict) and block.get("type") == "image_url"
 
 
 def _extract_image(block: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a supported image block into an internal image record."""
-    record: Dict[str, Any] = {"type": "image"}
-    if block.get("type") == "image_url":
-        image_url = block.get("image_url")
-        if isinstance(image_url, str):
-            record["url"] = image_url
-        else:
-            record["url"] = (image_url or {}).get("url", "")
-    else:
-        for key in ("source", "url", "data"):
-            if key in block:
-                record[key] = block[key]
-    if not any(record.get(key) for key in ("source", "url", "data")):
+    image_url = block.get("image_url")
+    url = image_url if isinstance(image_url, str) else (image_url or {}).get("url", "")
+    if not url:
         raise ValueError("Image block does not contain a valid source")
-    return record
+    return {"url": url}
 
 
 def _process_image_blocks(
     blocks: List[Any], image_placeholder: str = IMAGE_PLACEHOLDER
 ) -> Tuple[List[Any], List[Dict[str, Any]]]:
-    """Replace image blocks with placeholders and collect their records in order."""
     new_blocks: List[Any] = []
     images: List[Dict[str, Any]] = []
     for block in blocks:
@@ -587,7 +578,6 @@ def _process_image_blocks(
 
 
 def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
-    """Reject user-supplied image placeholder tokens in textual fields."""
     content = msg.get("content")
     if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
         raise ValueError(
@@ -604,7 +594,6 @@ def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
 def process_image_messages(
     messages: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Normalize image blocks and return their records in prompt order."""
     processed: List[Dict[str, Any]] = []
     images: List[Dict[str, Any]] = []
     for msg in messages:
@@ -664,14 +653,6 @@ def _encode_messages_text(
 ) -> str:
     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
     context = context if context else []
-
-    # Preprocess: merge tool messages and sort tool results
-    messages = merge_tool_messages(messages)
-    messages = sort_tool_results_by_call_order(context + messages)[len(context) :]
-    if context:
-        context = merge_tool_messages(context)
-        context = sort_tool_results_by_call_order(context)
-
     full_messages = context + messages
 
     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
@@ -710,15 +691,19 @@ def encode_messages(
     reasoning_effort: Union[str, int, None] = None,
     return_multi_modal_data: bool = False,
 ) -> Any:
-    """
-    Encode a list of messages into the DeepSeek-V4.1 prompt format.
+    """Encode a list of messages into the DeepSeek-V4.1 prompt format.
 
-    Handles BOS insertion, thinking mode with optional reasoning dropping, tool
-    message merging, multi-turn context, and image content blocks. Returns the
-    prompt string, or ``(prompt, {"images": [...]})`` when
+    Returns the prompt string, or ``(prompt, {"images": [...]})`` when
     ``return_multi_modal_data`` is set; the image records are in prompt order.
     """
-    context = context or []
+    # Validate before merging can discard message-level textual fields.
+    for msg in (context or []) + messages:
+        _validate_no_image_sp_tokens(msg)
+
+    # Collect images only after tool results are in their final prompt order.
+    context = merge_tool_messages(context or [])
+    messages = merge_tool_messages(messages)
+    messages = sort_tool_results_by_call_order(context + messages)[len(context) :]
     processed_context, _ = process_image_messages(context) if context else ([], [])
     processed_messages, images = process_image_messages(messages)
     prompt = _encode_messages_text(

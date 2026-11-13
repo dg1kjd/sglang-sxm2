@@ -9,15 +9,15 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.models.deepseek_v4 import DeepseekV4Model
+from sglang.srt.models.deepseek_v4 import DeepseekV4Sm70Model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _stub_model() -> DeepseekV4Model:
-    model = DeepseekV4Model.__new__(DeepseekV4Model)
+def _stub_model() -> DeepseekV4Sm70Model:
+    model = DeepseekV4Sm70Model.__new__(DeepseekV4Sm70Model)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(hidden_size=5120)
     model.hidden_size = 5120

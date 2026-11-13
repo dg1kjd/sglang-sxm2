@@ -8,7 +8,6 @@ import json
 
 import torch
 
-from sglang.srt.layers.engram import engram_shard_rows
 from sglang.srt.model_loader.dsv4_checkpoint_read import (
     DSV4CheckpointReader,
     contiguous_owned_expert_ids,
@@ -60,10 +59,8 @@ def _reader(**kwargs) -> DSV4CheckpointReader:
     defaults = dict(
         owned_expert_ids=frozenset(range(2)),
         n_routed=4,
-        tp_rank=0,
-        tp_size=1,
         mtp_only=False,
-        narrow_engram=False,
+        engram_rows=None,
     )
     defaults.update(kwargs)
     return DSV4CheckpointReader(**defaults)
@@ -123,17 +120,40 @@ class TestDsv4CheckpointRead(CustomTestCase):
         self.assertIsNone(reader("mtp.0.ffn.experts.1.w1.weight", handle))
         self.assertEqual(handle.full, ["mtp.0.ffn.experts.0.w1.weight"])
 
-    def test_engram_slice_uses_the_same_rows_as_the_module(self):
-        reader = _reader(narrow_engram=True, tp_rank=1, tp_size=2, owned_expert_ids=None)
+    def test_engram_slice_uses_the_rows_the_model_gives(self):
+        # Column-aligned ranges, as EngramEmbedding takes them from shard_range.
+        rows = {"layers.1.engram.embed.": (37, 61), "layers.14.engram.embed.": (0, 30)}
+        reader = _reader(engram_rows=rows, owned_expert_ids=None)
         handle = _Handle(rows=100, cols=8)
         tensor = reader("layers.1.engram.embed.scale", handle)
-        start, end = engram_shard_rows(100, 1, 2)
-        self.assertEqual(handle.slice.requested, slice(start, end))
-        self.assertEqual(tuple(tensor.shape), (end - start, 8))
+        self.assertEqual(handle.slice.requested, slice(37, 61))
+        self.assertEqual(tuple(tensor.shape), (24, 8))
         # The reader must hand back the mmap view. Cloning the shard OOMs
         # this host: eight ranks each private-copy ~12 GiB onto a 64 GiB node.
         self.assertEqual(tensor.data_ptr(), handle.slice.tensor.data_ptr())
+        reader("layers.14.engram.embed.weight", handle)
+        self.assertEqual(handle.slice.requested, slice(0, 30))
         self.assertEqual(handle.full, [])
+        reader.finish()
+
+    def test_engram_table_without_a_range_fails(self):
+        reader = _reader(engram_rows={"layers.1.engram.embed.": (0, 50)})
+        with self.assertRaisesRegex(RuntimeError, "no Engram row range"):
+            reader("layers.2.engram.embed.weight", _Handle(rows=100, cols=8))
+
+    def test_finish_raises_when_an_engram_table_was_never_read(self):
+        rows = {"layers.1.engram.embed.": (0, 50), "layers.14.engram.embed.": (0, 50)}
+        reader = _reader(engram_rows=rows, owned_expert_ids=None)
+        reader("layers.1.engram.embed.weight", _Handle(rows=100, cols=8))
+        with self.assertRaisesRegex(RuntimeError, "layers.14.engram.embed."):
+            reader.finish()
+
+    def test_whole_engram_table_without_ranges(self):
+        reader = _reader(owned_expert_ids=None)
+        handle = _Handle(rows=100, cols=8)
+        reader("layers.1.engram.embed.weight", handle)
+        self.assertEqual(handle.full, ["layers.1.engram.embed.weight"])
+        reader.finish()
 
     def test_finish_raises_when_an_owned_expert_was_never_read(self):
         reader = _reader()
@@ -213,12 +233,10 @@ class TestDsv4CheckpointRead(CustomTestCase):
                 if drop_expert:
                     skipped_bytes += size
                 elif drop_engram:
-                    # Rank keeps one TP slice. The other 7/8 are not read.
-                    rows = meta["shape"][0]
-                    start, end = engram_shard_rows(rows, 3, 8)
-                    frac = (end - start) / rows
-                    kept_bytes += int(size * frac)
-                    skipped_bytes += size - int(size * frac)
+                    # Rank keeps one TP slice, about 1/8 of the rows; the rest
+                    # is not read.
+                    kept_bytes += size // 8
+                    skipped_bytes += size - size // 8
                 else:
                     kept_bytes += size
         # Remote experts alone are the bulk of what used to be read and discarded.
@@ -235,8 +253,7 @@ class TestDsv4CheckpointRead(CustomTestCase):
         started = time.perf_counter()
         with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
             view = handle.get_slice("layers.14.engram.embed.weight")
-            rows = int(view.get_shape()[0])
-            start, _end = engram_shard_rows(rows, 0, 8)
+            start = int(view.get_shape()[0]) // 2
             shard = view[start : start + 4]
         elapsed = time.perf_counter() - started
         self.assertEqual(tuple(shard.shape), (4, 256))

@@ -4,7 +4,7 @@ GLM-5.3-Flash on 8× V100-SXM2-32GB, set up for one agentic coding session: a ma
 
 ## Get the model
 
-The validated checkpoint is RadixArk's NVFP4 quantisation (ModelOpt). 190 GB. The MTP draft layer is in the same repo. The export carries a vision tower; this port serves text only (`--language-only`). The model is MIT-licensed.
+The validated checkpoint is RadixArk's NVFP4 quantisation (ModelOpt). 190 GB. The MTP draft layer is in the same repo, and so is the vision tower: the server takes images and video (see [Images and video](#images-and-video)). The model is MIT-licensed.
 
 ```bash
 pip install -U "huggingface_hub[cli]"
@@ -40,37 +40,63 @@ The model has three reasoning efforts: Low, High and Max. The server reads `reas
 
 ## Measured performance
 
-The reference recipe below: TP=8, MTP 3 steps / 4 draft tokens, `--max-running-requests 1`, temperature 0. KV pool 242,880 tokens, context 240,640.
+The reference recipe below: TP=8, MTP 3 steps / 4 draft tokens, `--max-running-requests 1`, temperature 0, vision on. KV pool 286,464 tokens, context 240,640.
 
-**Decode** (2026-10-06). Six chat prompts, 512 tokens each, streamed from `/generate`; tok/s excludes TTFT. Accept length is tokens per target forward.
+**Decode** (2026-11-12). Six chat prompts, 512 tokens each, streamed from `/generate`; tok/s excludes TTFT. Accept length is tokens per target forward.
 
 | prompt | tok/s | accept length |
 |---|---:|---:|
-| code | 174.3 | 2.89 |
-| refactor | 180.0 | 2.99 |
-| explain | 152.3 | 2.52 |
-| math | 196.6 | 3.26 |
-| agent step | 179.0 | 2.98 |
-| German prose | 175.3 | 2.89 |
-| **all six** | **175.2** | |
+| code | 176.3 | 2.89 |
+| refactor | 182.0 | 2.99 |
+| explain | 154.0 | 2.52 |
+| math | 198.7 | 3.26 |
+| agent step | 181.0 | 2.98 |
+| German prose | 177.2 | 2.89 |
+| **all six** | **177.1** | |
 
-**Agent session** (2026-10-02). Through `/v1/chat/completions` with a `bash` tool: source files as the first user message, then three turns that each append an assistant tool call and its result (~500–700 new tokens). TTFT includes rendering and tokenizing the whole chat on the server. The first request with a new set of tools also compiles its tool-call grammar, about 7 s once per tool set; the rows below were measured after that.
+**Agent session** (2026-11-12). Through `/v1/chat/completions` with a `bash` tool: source files as the first user message, then three turns that each append an assistant tool call and its result (~500–700 new tokens). TTFT includes rendering and tokenizing the whole chat on the server. The first request with a new set of tools also compiles its tool-call grammar, about 7 s once per tool set; the rows below were measured after that.
 
 | context | cold first turn | tool turns 1 / 2 / 3 |
 |---|---:|---:|
-| 32,187 tokens | 16.1 s | 554 / 490 / 443 ms |
-| 128,188 tokens | 68.1 s | 701 / 619 / 550 ms |
-| 190,188 tokens | 104.7 s | 768 / 702 / 602 ms |
+| 32,203 tokens | 15.8 s | 603 / 523 / 525 ms |
+| 128,203 tokens | 66.9 s | 706 / 615 / 633 ms |
+| 190,203 tokens | 103.2 s | 1148 / 1031 / 1036 ms |
 
-**Main session plus subagents** (2026-10-02). A 190k main conversation, then two fresh ~20k subagent conversations of three turns each, with a main turn after each subagent. The main turns stay cached:
+At 190k the tool turns are slower than on 2026-10-02 (768 / 702 / 602 ms); 32k and 128k are about the same. The change came between 2026-10-02 and 2026-11-11 and is not found yet. Rendering and tokenizing the whole chat takes about 0.5 s of each turn at 190k (0.35 s at 128k).
+
+**Main session plus subagents** (2026-11-12). A 190k main conversation, then two fresh ~17k subagent conversations of three turns each, with a main turn after each subagent. The main turns stay cached:
 
 | turn | TTFT |
 |---|---:|
-| main, cold / next turn | 103.9 s / 757 ms |
-| subagent 1, cold / turns 2–3 | 9.68 s / 538, 515 ms |
-| main | 694 ms |
-| subagent 2, cold / turns 2–3 | 9.62 s / 531, 503 ms |
-| main | 633 ms |
+| main, cold / next turn | 103.2 s / 1177 ms |
+| subagent 1, cold / turns 2–3 | 8.46 s / 565, 480 ms |
+| main | 1011 ms |
+| subagent 2, cold / turns 2–3 | 8.44 s / 561, 460 ms |
+| main | 1044 ms |
+
+## Images and video
+
+Images and videos go in as `image_url` and `video_url` content parts of a chat message (OpenAI API), or as `image` blocks (Anthropic API). Vision costs no context: the vision tower's weights (190 MiB per GPU) stay in pinned host memory and are copied to the GPU for each image, or each group of video frames, and freed afterwards. Image preprocessing runs on the CPU, and encoded images are cached in host memory, so an image that spans several prefill chunks is encoded once. The parts of the tower that stay on the GPU take about 20 MB per GPU, under 1% of the KV pool.
+
+**Measured** (2026-11-11). Requests with a short answer, image not seen before, the same recipe with MTP. Every answer was correct.
+
+| input | prompt tokens | time |
+|---|---:|---:|
+| image 448×448 | 298 | 0.5 s |
+| image 2048×1536 | 4,112 | 2.9 s |
+| image 3840×2160 | 8,015 | 5.7 s |
+| video 640×360, 8 s | 2,476 | 3.0 s |
+| video 1280×720, 60 s (at the 32,768-token cap) | 32,016 | 22.9 s |
+
+GPU memory: the first large image makes PyTorch reserve about 650 MiB more per GPU, and it keeps that memory. The 60 s video needed up to 1.3 GB more on the first GPU, against the 2.5 GB left free after start.
+
+| knob | default | effect |
+|---|---|---|
+| `GLM53_VISION` | 1 | `0` serves text only (`--language-only`): KV pool 294,144 tokens instead of 286,464. The context limit stays 240,640; the extra room keeps more earlier conversations cached |
+| `GLM53_VIDEO_MAX_TOKENS` | 32768 | Token budget shared by all videos of one request; a video above it is scaled down to fit. The checkpoint's own limit is the whole context, and every GPU holds a video's embedding while it is prefilled |
+| `SGLANG_VLM_CACHE_SIZE_MB` | 512 | Encoded-image cache per GPU, in pinned host memory (`SGLANG_USE_HOST_VLM_CACHE=1`); holds about eight full-size images or two capped videos |
+
+Vision needs transformers 5.19 or newer (in `requirements.txt`). The wrapper checks at start and stops with a message if the checkpoint's processor does not import.
 
 ## Reference recipe
 
@@ -102,6 +128,9 @@ export SGLANG_DSV41_HIER_AR=1
 export SGLANG_DSV41_HIER_AR_CA=1
 export SGLANG_DSV41_HIER_AR_PUSH=1
 export SGLANG_NVFP4_CKPT_NVFP4_NEXTN_MOE=1
+export SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1
+export SGLANG_USE_HOST_VLM_CACHE=1
+export SGLANG_VLM_CACHE_SIZE_MB=512
 
 python -m sglang.launch_server \
   --model-path "${GLM53_MODEL}" \
@@ -112,7 +141,6 @@ python -m sglang.launch_server \
   --dtype float16 \
   --quantization modelopt_fp4 \
   --fp4-gemm-backend marlin \
-  --language-only \
   --tensor-parallel-size 8 \
   --ep-size 1 \
   --attention-backend dsa \
@@ -132,6 +160,7 @@ python -m sglang.launch_server \
   --sleep-on-idle \
   --context-length 240640 \
   --mem-fraction-static 0.935 \
+  --mm-process-config '{"video": {"max_image_tokens": 32768}}' \
   --speculative-algorithm EAGLE \
   --speculative-draft-model-path "${GLM53_MODEL}" \
   --speculative-num-steps 3 \
@@ -147,7 +176,7 @@ python -m sglang.launch_server \
 | draft experts | NVFP4 at load (`SGLANG_NVFP4_CKPT_NVFP4_NEXTN_MOE=1`) | Draft weights 2.4 → 1.06 GB per rank, which buys KV pool, and acceptance is the same as the BF16 draft |
 | `--ep-size` | 1 | Experts TP-sliced: every rank does the same MoE work per token. With EP=8 the other ranks waited for the one holding most routes |
 | `--max-running-requests` | 1 | The decode and verify kernels give each row the same result as batch 1 only while the whole launch has at most 4 rows (1 request × 4 draft tokens) |
-| `--mem-fraction-static` | 0.935 | Leaves a 242,880-token KV pool. Without MTP use 0.88 (225,600-token pool) |
+| `--mem-fraction-static` | 0.935 | Leaves a 286,464-token KV pool. Without MTP use 0.88 (225,600-token pool, measured 2026-10-06) |
 | `--context-length` | 240,640 | Kept below the pool so prompt plus completion always fits. Without MTP use 223,232 |
 | `--max-mamba-cache-size` / `--mamba-max-states-per-path` | 12 / 2 | A running request pins 4 slots and admission wants 3 free. With 8 slots a subagent call evicted the main session's states, which cost a 100k+ re-prefill on the next main turn |
 | prefill chunk | 2048 | The measured value. Larger chunks have not been tried with the memory a 0.935 pool leaves |
@@ -160,10 +189,11 @@ Without MTP (`GLM53_MTP_STEPS=0` in the wrapper): drop the five `--speculative-*
 ## Limitations
 
 - One request at a time. A second request queues behind the first.
-- Text only (`--language-only`).
-- A fresh subagent conversation pays its own cold prefill (about 10 s at 20k tokens).
+- Videos are capped at 32,768 tokens per request (`GLM53_VIDEO_MAX_TOKENS`).
+- A fresh subagent conversation pays its own cold prefill (about 8.5 s at 17k tokens).
+- Tool turns at 190k take about 1.0–1.15 s, against 0.6–0.77 s on 2026-10-02; not found yet.
 - The first request with a new set of tools compiles its tool-call grammar, about 7 s once per tool set.
-- Checked with the benchmarks above and GSM8K (0.923 over 1,319 questions with MTP, on an earlier build of this recipe). No multi-hour soak yet.
+- Checked with the benchmarks above and GSM8K (0.926 over 1,319 questions, 5-shot, greedy, with MTP; 2026-11-12). No multi-hour soak yet.
 
 ## PCIe V100s
 

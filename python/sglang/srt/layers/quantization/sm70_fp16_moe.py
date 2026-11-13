@@ -66,7 +66,7 @@ class SM70FP16MoEMethod(UnquantizedFusedMoEMethod):
     def __init__(self):
         if not _load_sm70_ops():
             raise RuntimeError("SM70 FP16 MoE operators are unavailable")
-        super().__init__(use_triton_kernels=False)
+        super().__init__()
 
     def create_moe_runner(self, layer, moe_runner_config):
         # The Triton runner serves configs the TurboMind kernels do not implement.

@@ -2,6 +2,7 @@ import torch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.ops.attention.fast_topk import fast_topk as jit_fast_topk
+from sglang.kernels.ops.attention.ordered_topk import ordered_topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -15,6 +16,7 @@ def torch_topk(score, lengths, topk):
 
 FN_MAP = {
     "jit": jit_fast_topk,
+    "ordered": ordered_topk,
     "torch_topk": torch_topk,
 }
 
@@ -24,7 +26,7 @@ FN_MAP = {
     [(1, 2048), (128, 2048), (1024, 2048), (8000, 2048), (1024, 32768)],
     [(1024, 2048)],
 )
-@marker.benchmark("impl", ["jit", "torch_topk"])
+@marker.benchmark("impl", ["jit", "ordered", "torch_topk"])
 def benchmark(batch: int, length: int, impl: str):
     topk = 512
     score = create_random(batch, length, dtype=torch.float32)

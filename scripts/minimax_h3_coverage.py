@@ -289,9 +289,9 @@ def contract_cases(keyframe: str) -> list[dict[str, Any]]:
             "body": base_request(quality="high"),
         },
         {
-            "id": "reject_steps_below_2",
+            "id": "reject_steps_zero",
             "expect": "num_inference_steps",
-            "body": base_request(num_inference_steps=1),
+            "body": base_request(num_inference_steps=0),
         },
         {
             "id": "reject_short_edge_zero",

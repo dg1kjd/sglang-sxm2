@@ -17,9 +17,11 @@ nothing -- so a missed path produces wrong output, not a crash.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
+from typing import Sequence
 
 _KERNELS_ROOT = Path(__file__).resolve().parent
 
@@ -82,3 +84,34 @@ def sm70_prebuilt(name: str) -> Path:
 def sm70_csrc(*parts: str) -> Path:
     """A CUDA source under the JIT tree, e.g. ``sm70_csrc("sm70_longctx_decode.cu")``."""
     return _KERNELS_ROOT.joinpath("jit", "csrc", *parts)
+
+
+# Environment that changes the compiler command torch writes into build.ninja.
+_JIT_BUILD_ENV = (
+    "CUDA_HOME",
+    "CC",
+    "CXX",
+    "CUDAHOSTCXX",
+    "NVCC_PREPEND_FLAGS",
+    "NVCC_APPEND_FLAGS",
+    "TORCH_CUDA_ARCH_LIST",
+)
+
+
+def sm70_jit_build_dir(base: str, source: str, cuda_cflags: Sequence[str]) -> str:
+    """``base/<key>``, created: one ``load_inline`` build directory per source,
+    flags and compiler environment.
+
+    torch keeps one build per directory, and a process that finds another's
+    build lock there waits and then imports whatever that build produced. In one
+    fixed directory, two checkouts with different sources would load each
+    other's library, and a test run and a serve script with different host
+    compilers would rebuild on every switch."""
+    key = "\0".join(
+        [source, *cuda_cflags, *(os.environ.get(name, "") for name in _JIT_BUILD_ENV)]
+    )
+    path = os.path.join(
+        os.path.expanduser(base), hashlib.sha256(key.encode()).hexdigest()[:16]
+    )
+    os.makedirs(path, exist_ok=True)
+    return path

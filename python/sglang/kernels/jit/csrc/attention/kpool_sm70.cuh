@@ -132,7 +132,7 @@ struct DecodeParams {
   const void* seq_lens;
   const void* out_cache_loc;
   bool req_is64, pos_is64, seq_is64, loc_is64;
-  int64_t slots_per_page;
+  int64_t index_page_size;
   bool round_scale;
 };
 
@@ -234,16 +234,18 @@ __global__ __launch_bounds__(kDim) void decode_update_kernel(const DecodeParams 
     float q, scale;
     compress_pool<kPool>(k, s, p.ape, p.ape_stride, d, s_x, s_max, p.round_scale, q, scale);
 
+    // Block-table entries count 64-token pages. Index page k covers pages
+    // kPool * k .. kPool * k + kPool - 1 (one logical page), so it is entry / kPool.
     const int64_t pool_id = safe_pos / kPool;
-    int64_t col = (pool_id / p.slots_per_page) * kPool;
+    int64_t col = (pool_id / p.index_page_size) * kPool;
     col = col < 0 ? 0 : (col > p.bt_cols - 1 ? p.bt_cols - 1 : col);
-    const int64_t page = p.block_tables[row * p.bt_stride0 + col * p.bt_stride1];
-    const int64_t page_slot = pool_id % p.slots_per_page;
-    if (page >= 0) {
-      uint8_t* page_ptr = p.buf + page * p.page_bytes;
+    const int64_t entry = p.block_tables[row * p.bt_stride0 + col * p.bt_stride1];
+    const int64_t page_slot = pool_id % p.index_page_size;
+    if (entry >= 0) {
+      uint8_t* page_ptr = p.buf + (entry / kPool) * p.page_bytes;
       page_ptr[page_slot * kDim + d] = to_e4m3fn(q);
       if (d == 0) {
-        reinterpret_cast<float*>(page_ptr + p.slots_per_page * kDim)[page_slot] = scale;
+        reinterpret_cast<float*>(page_ptr + p.index_page_size * kDim)[page_slot] = scale;
       }
     }
   }
@@ -278,7 +280,7 @@ struct VerifyParams {
   const void* effective_n;  // [bs] or null
   bool req_is64, ws_is64, tls_is64, loc_is64, eff_is64;
   int64_t n;
-  int64_t slots_per_page;
+  int64_t index_page_size;
   bool round_scale;
 };
 
@@ -328,11 +330,11 @@ __global__ __launch_bounds__(kDim) void verify_write_kernel(const VerifyParams p
     compress_pool<kPool>(k, s, p.ape, p.ape_stride, d, s_x, s_max, p.round_scale, q, scale);
 
     const int64_t loc = p.write_loc[b * p.write_loc_stride + c];
-    uint8_t* page_ptr = p.buf + (loc / p.slots_per_page) * p.page_bytes;
-    const int64_t page_slot = loc % p.slots_per_page;
+    uint8_t* page_ptr = p.buf + (loc / p.index_page_size) * p.page_bytes;
+    const int64_t page_slot = loc % p.index_page_size;
     page_ptr[page_slot * kDim + d] = to_e4m3fn(q);
     if (d == 0) {
-      reinterpret_cast<float*>(page_ptr + p.slots_per_page * kDim)[page_slot] = scale;
+      reinterpret_cast<float*>(page_ptr + p.index_page_size * kDim)[page_slot] = scale;
     }
   }
 }
@@ -406,7 +408,7 @@ void decode_update(tvm::ffi::TensorView buf,
                    tvm::ffi::TensorView positions,
                    tvm::ffi::TensorView seq_lens,
                    tvm::ffi::TensorView out_cache_loc,
-                   int64_t slots_per_page,
+                   int64_t index_page_size,
                    bool round_scale) {
   using namespace host;
   SymbolicSize n = {"rows"};
@@ -436,8 +438,8 @@ void decode_update(tvm::ffi::TensorView buf,
                    out_cache_loc.size(0) >= rows && bt_rows.unwrap() >= rows,
                "index tensors shorter than the key rows");
   RuntimeCheck(tail.unwrap() >= pool.unwrap(), "tail must hold a full pool");
-  RuntimeCheck(page_bytes.unwrap() >= slots_per_page * (kDim + 4) && page_bytes.unwrap() % 4 == 0,
-               "page too small for slots_per_page");
+  RuntimeCheck(page_bytes.unwrap() >= index_page_size * (kDim + 4) && page_bytes.unwrap() % 4 == 0,
+               "page too small for index_page_size");
   if (rows == 0) {
     return;
   }
@@ -470,7 +472,7 @@ void decode_update(tvm::ffi::TensorView buf,
       .pos_is64 = is_int64(positions),
       .seq_is64 = is_int64(seq_lens),
       .loc_is64 = is_int64(out_cache_loc),
-      .slots_per_page = slots_per_page,
+      .index_page_size = index_page_size,
       .round_scale = round_scale,
   };
   if (dtype.is_type<fp16_t>()) {
@@ -515,7 +517,7 @@ void verify_write(tvm::ffi::TensorView buf,
                   tvm::ffi::TensorView out_cache_loc,
                   tvm::ffi::TensorView effective_n,
                   int64_t n,
-                  int64_t slots_per_page,
+                  int64_t index_page_size,
                   bool round_scale) {
   using namespace host;
   SymbolicSize rows = {"rows"};
@@ -546,8 +548,8 @@ void verify_write(tvm::ffi::TensorView buf,
                "index tensors shorter than the batch");
   RuntimeCheck(effective_n.numel() == 0 || effective_n.size(0) >= bs.unwrap(), "effective_n shorter than the batch");
   RuntimeCheck(tail.unwrap() >= pool.unwrap() + n - 1, "tail must hold a pool plus the drafts");
-  RuntimeCheck(page_bytes.unwrap() >= slots_per_page * (kDim + 4) && page_bytes.unwrap() % 4 == 0,
-               "page too small for slots_per_page");
+  RuntimeCheck(page_bytes.unwrap() >= index_page_size * (kDim + 4) && page_bytes.unwrap() % 4 == 0,
+               "page too small for index_page_size");
   if (bs.unwrap() == 0) {
     return;
   }
@@ -581,7 +583,7 @@ void verify_write(tvm::ffi::TensorView buf,
       .loc_is64 = is_int64(out_cache_loc),
       .eff_is64 = effective_n.numel() != 0 && is_int64(effective_n),
       .n = n,
-      .slots_per_page = slots_per_page,
+      .index_page_size = index_page_size,
       .round_scale = round_scale,
   };
   if (dtype.is_type<fp16_t>()) {

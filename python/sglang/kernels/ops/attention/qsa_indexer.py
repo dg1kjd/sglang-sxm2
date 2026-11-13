@@ -38,7 +38,11 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_qsa_indexer_module(
-    dtype: torch.dtype, out_dtype: torch.dtype, head_dim: int, is_neox_style: bool
+    dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    head_dim: int,
+    is_neox_style: bool,
+    cache_dtype: torch.dtype,
 ) -> Module:
     """Compile and cache the JIT QSA indexer module for one specialisation."""
     if dtype not in (torch.bfloat16, torch.float16):
@@ -52,8 +56,13 @@ def _jit_qsa_indexer_module(
         raise RuntimeError(
             f"Unsupported index head_dim {head_dim}. Supported: 64, 128, 256"
         )
+    if cache_dtype not in (torch.float32, dtype):
+        raise RuntimeError(
+            f"Unsupported RoPE cache dtype {cache_dtype} for {dtype} input. "
+            "Supported: float32, or the input dtype"
+        )
     args = make_cpp_args(
-        dtype, out_dtype, head_dim, is_neox_style, is_arch_support_pdl()
+        dtype, out_dtype, head_dim, is_neox_style, is_arch_support_pdl(), cache_dtype
     )
     return load_jit(
         "qsa_indexer",
@@ -91,7 +100,8 @@ def qsa_index_q_norm_rope_store(
                       contiguous fused index Q/K projection output
     positions       : CUDA int64 [tokens] or [3, tokens] RoPE positions
                       (a strided trailing slice is accepted)
-    cos_sin_cache   : CUDA fp32 [capacity, rotary_dim] RoPE cache
+    cos_sin_cache   : CUDA fp32 or qk-dtype [capacity, rotary_dim] RoPE cache;
+                      cos/sin are rounded to the qk dtype either way, as in eager RoPE
     axis_map        : CUDA int32 [rotary_dim // 2] position-axis per pair index
     weight          : [head_dim] gemma norm weight (kernel applies 1 + w)
     cache_loc       : CUDA int64 [tokens] state slots of each token
@@ -121,7 +131,9 @@ def qsa_index_q_norm_rope_store(
     q_out = torch.empty(
         (num_tokens, q_heads_padded, head_dim), dtype=out_dtype, device=qk.device
     )
-    module = _jit_qsa_indexer_module(qk.dtype, out_dtype, head_dim, is_neox_style)
+    module = _jit_qsa_indexer_module(
+        qk.dtype, out_dtype, head_dim, is_neox_style, cos_sin_cache.dtype
+    )
     module.q_prep(
         qk,
         q_out,
@@ -164,7 +176,7 @@ def qsa_index_k_compress_store(
                        completed group, group-start slot in column 0 (its RoPE
                        position rotates the group; other columns any order)
     rope_position_buffer : CUDA int64 [slots, 3] per-slot RoPE coordinates
-    cos_sin_cache    : CUDA fp32 [capacity, rotary_dim] RoPE cache
+    cos_sin_cache    : CUDA fp32 or key-dtype [capacity, rotary_dim] RoPE cache
     axis_map         : CUDA int32 [rotary_dim // 2] position-axis per pair index
     weight           : [head_dim] gemma norm weight (kernel applies 1 + w)
     write_locs       : CUDA int32 [groups] compressed-cache slots to write
@@ -177,7 +189,11 @@ def qsa_index_k_compress_store(
     """
     head_dim = weight.shape[0]
     module = _jit_qsa_indexer_module(
-        key_state_buffer.dtype, compressed_k_buffer.dtype, head_dim, is_neox_style
+        key_state_buffer.dtype,
+        compressed_k_buffer.dtype,
+        head_dim,
+        is_neox_style,
+        cos_sin_cache.dtype,
     )
     module.k_compress(
         key_state_buffer,

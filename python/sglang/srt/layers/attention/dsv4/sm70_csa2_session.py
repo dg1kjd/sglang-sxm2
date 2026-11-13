@@ -84,6 +84,11 @@ def request_load(key: str) -> None:
     _LOAD = str(key)
 
 
+def load_pending() -> Optional[str]:
+    """The key of a requested load the worker has not taken yet."""
+    return _LOAD
+
+
 def take_handoff() -> Tuple[Optional[str], Optional[str]]:
     global _SPILL, _LOAD
     spill, load = _SPILL, _LOAD

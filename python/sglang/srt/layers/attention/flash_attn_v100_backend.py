@@ -101,7 +101,7 @@ def _load_paged_forward():
         from sglang.srt.layers.attention.tilelang_fa_v100 import (
             paged_forward as _tl_paged,
         )
-        from sglang.srt.utils.common import get_device_sm, is_cuda
+        from sglang.srt.utils.device import get_device_sm, is_cuda
 
         if is_cuda() and get_device_sm() == 70:
             _paged_forward = _tl_paged

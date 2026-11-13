@@ -55,9 +55,7 @@ class TestDeepSeekV41Detector(CustomTestCase):
                 ),
             )
         ]
-        self.params = encode_arguments_to_dsml(
-            {"arguments": {"city": "SF"}}
-        )
+        self.params = encode_arguments_to_dsml({"arguments": {"city": "SF"}})
 
     def test_tokens_use_spaced_v41_names(self):
         detector = DeepSeekV41Detector()

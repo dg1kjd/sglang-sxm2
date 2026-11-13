@@ -15,7 +15,8 @@ from typing import Any, Optional
 import torch
 
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_available_gpu_memory, next_power_of_2
+from sglang.srt.utils.device import get_available_gpu_memory
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,6 @@ def _prewarm_allocator_kernels(*, device: str, page_size: int, pool_len: int) ->
         last_loc,
         free_pages,
         out_indices,
-        bs_upper,
         page_size,
     )
 

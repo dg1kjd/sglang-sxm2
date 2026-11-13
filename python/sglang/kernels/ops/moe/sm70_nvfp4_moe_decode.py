@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from sglang.kernels.sm70_paths import sm70_csrc
+from sglang.kernels.sm70_paths import sm70_csrc, sm70_jit_build_dir
 
 logger = logging.getLogger(__name__)
 
@@ -46,20 +46,23 @@ def _load_sm70_nvfp4_moe_decode_ops():
 
     from torch.utils.cpp_extension import load_inline
 
-    build_directory = os.environ.get(
-        "SGLANG_V100_NVFP4_MOE_BUILD_DIR", "/tmp/sglang_sm70_nvfp4_moe"
+    source = _SRC_PATH.read_text()
+    cuda_cflags = ["-O3", "--use_fast_math"]
+    build_directory = sm70_jit_build_dir(
+        os.environ.get("SGLANG_V100_NVFP4_MOE_BUILD_DIR", "/tmp/sglang_sm70_nvfp4_moe"),
+        source,
+        cuda_cflags,
     )
-    os.makedirs(build_directory, exist_ok=True)
     try:
         _EXT = load_inline(
             name="sglang_sm70_nvfp4_moe_v100",
             cpp_sources="",
-            cuda_sources=_SRC_PATH.read_text(),
+            cuda_sources=source,
             functions=None,
             is_python_module=True,
             verbose=False,
             build_directory=build_directory,
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_cuda_cflags=cuda_cflags,
         )
     except Exception:  # pragma: no cover - build failures are environment-specific
         logger.exception("SM70 NVFP4 MoE decode extension failed to build")
@@ -85,17 +88,28 @@ def sm70_nvfp4_moe_decode(
         raise RuntimeError("SM70 NVFP4 MoE decode extension is unavailable")
     batch_size = hidden_states.shape[0]
     num_routes = batch_size * 10
-    gate_up_partials = torch.empty(
-        (40, num_routes, 320), dtype=torch.float32, device=hidden_states.device
-    )
-    activated = torch.empty(
-        (num_routes, 160), dtype=torch.float16, device=hidden_states.device
-    )
-    down_partials = torch.empty(
-        (num_routes, 5, 2560), dtype=torch.float32, device=hidden_states.device
-    )
+    device = hidden_states.device
+    # Must match vector_ok in decode(): the two-kernel path needs 16-byte operands
+    # (w2_scales 8) and only per-route pre-activations; the fallback needs full scratch.
+    aligned = all(
+        t.data_ptr() % 16 == 0 for t in (hidden_states, w13, w2, w13_scales)
+    ) and (w2_scales.data_ptr() % 8 == 0)
+    if aligned:
+        gate_up_partials = torch.empty(
+            (num_routes, 320), dtype=torch.float32, device=device
+        )
+        activated = torch.empty((0,), dtype=torch.float16, device=device)
+        down_partials = torch.empty((0,), dtype=torch.float32, device=device)
+    else:
+        gate_up_partials = torch.empty(
+            (40, num_routes, 320), dtype=torch.float32, device=device
+        )
+        activated = torch.empty((num_routes, 160), dtype=torch.float16, device=device)
+        down_partials = torch.empty(
+            (num_routes, 5, 2560), dtype=torch.float32, device=device
+        )
     output = torch.empty_like(hidden_states)
-    ext.decode(
+    (ext.decode if aligned else ext.decode_legacy)(
         hidden_states,
         w13,
         w2,
@@ -121,8 +135,6 @@ def sm70_topk10_softmax(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     weights = torch.empty(
         (logits.shape[0], 10), dtype=torch.float32, device=logits.device
     )
-    ids = torch.empty(
-        (logits.shape[0], 10), dtype=torch.int32, device=logits.device
-    )
+    ids = torch.empty((logits.shape[0], 10), dtype=torch.int32, device=logits.device)
     ext.topk10_softmax(logits, weights, ids)
     return weights, ids

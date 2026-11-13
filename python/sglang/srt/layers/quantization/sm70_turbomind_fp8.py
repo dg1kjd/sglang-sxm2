@@ -9,7 +9,7 @@ from typing import Optional
 
 import torch
 from torch.nn.parameter import Parameter
-from sglang.kernels.sm70_paths import sm70_csrc, sm70_prebuilt
+from sglang.kernels.sm70_paths import sm70_csrc, sm70_jit_build_dir, sm70_prebuilt
 
 logger = logging.getLogger(__name__)
 
@@ -117,19 +117,22 @@ def _load_sm70_qpn8_ops():
         raise RuntimeError("SM70 QPN8 decode requires an NVIDIA SM70 GPU.")
     from torch.utils.cpp_extension import load_inline
 
-    build_directory = os.environ.get(
-        "SGLANG_SM70_QPN8_BUILD_DIR", "/tmp/sglang_qpn8_build"
+    source = _QPN8_SRC_PATH.read_text()
+    cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    build_directory = sm70_jit_build_dir(
+        os.environ.get("SGLANG_SM70_QPN8_BUILD_DIR", "/tmp/sglang_qpn8_build"),
+        source,
+        cuda_cflags,
     )
-    os.makedirs(build_directory, exist_ok=True)
     _QPN8_EXT = load_inline(
         name="sglang_sm70_qpn8_v100",
         cpp_sources="",
-        cuda_sources=_QPN8_SRC_PATH.read_text(),
+        cuda_sources=source,
         functions=None,
         is_python_module=True,
         verbose=False,
         build_directory=build_directory,
-        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+        extra_cuda_cflags=cuda_cflags,
     )
     logger.info_once(
         "SM70 (V100): QPN8 decode extension loaded from %s.",

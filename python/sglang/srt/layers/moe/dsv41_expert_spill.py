@@ -1445,7 +1445,7 @@ try:
         eager_on_graph,
     )
 
-    ensure_spill_experts = eager_on_graph(True)(ensure_spill_experts)
+    ensure_spill_experts = eager_on_graph(ensure_spill_experts, run_at_capture=True)
 except ImportError:
     pass
 

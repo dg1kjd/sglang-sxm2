@@ -12,7 +12,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("tokens", [2, 4])
 @pytest.mark.parametrize("seed", [7, 31])
 def test_verify_tiles_preserve_states_and_graph_replay(tokens, seed, monkeypatch):
-    import sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent as gdn
+    import sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent as gdn
 
     torch.manual_seed(seed)
     qkv = torch.randn(1, tokens, 2560, device="cuda", dtype=torch.float16) * 0.1

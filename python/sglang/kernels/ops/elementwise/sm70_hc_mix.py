@@ -7,19 +7,6 @@ from sglang.srt.environ import envs
 
 
 @cache_once
-def _module():
-    return load_jit(
-        "sm70_hc_mix",
-        cuda_files=["elementwise/sm70_hc_mix.cuh"],
-        cuda_wrappers=[
-            ("down", "sglang::sm70_hc::down"),
-            ("up", "sglang::sm70_hc::up"),
-        ],
-        extra_cuda_cflags=["--fmad=false"],
-    )
-
-
-@cache_once
 def _batch_module(rows):
     return load_jit(
         "sm70_hc_batch",
@@ -35,8 +22,7 @@ def _batch_module(rows):
 
 def hc_down(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     output = torch.empty((x.shape[0], 320), device=x.device, dtype=x.dtype)
-    module = _module() if x.shape[0] == 1 else _batch_module(x.shape[0])
-    module.down(x, weight, output)
+    _batch_module(x.shape[0]).down(x, weight, output)
     return output
 
 
@@ -44,8 +30,7 @@ def hc_up(
     activated: torch.Tensor, x: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
     output = torch.empty((x.shape[0], 2560), device=x.device, dtype=x.dtype)
-    module = _module() if x.shape[0] == 1 else _batch_module(x.shape[0])
-    module.up(activated, x, weight, output)
+    _batch_module(x.shape[0]).up(activated, x, weight, output)
     return output
 
 

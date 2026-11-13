@@ -16,6 +16,7 @@ class Sm70KDAKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = False
     supports_safe_gate: bool = True
+    supports_safe_gate_verify: bool = True
     supports_track_state_snapshot: bool = True
     # The bf16 fused chain-verify kernel is not this path.
     supports_fused_chain_verify: bool = False

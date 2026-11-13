@@ -1,5 +1,6 @@
 import re
 from typing import List, Literal, Optional, Union
+
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import StructuralTag
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector

@@ -135,6 +135,7 @@ def test_dflash2_selector_rejects_quantized_target_head():
     model = SimpleNamespace(
         lm_head=SimpleNamespace(weight=torch.empty(8, 4, dtype=torch.int8)),
         candidate_selector=SimpleNamespace(top_k=4),
+        merge_candidates_fused=False,
     )
     with pytest.raises(RuntimeError, match="requires a dense"):
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))

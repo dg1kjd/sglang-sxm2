@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-"""One-slot token-id continuation on top of ChunkCache.
+"""One-slot token-id continuation on top of a disabled radix cache.
 
 Used when radix is off (SM70 CSA2 state is not in the tree) but a single
 full-history chat should not re-prefill from position 0 every HTTP turn.
 
 Exact continuation (``new_ids`` starts with the whole pinned sequence) reuses
 the live CSA2 image. A shorter shared prefix hits only when that length was
-recorded at a quiescent stop. Unfinished stops use ``extend_range.end`` — the
+recorded at a quiescent stop. Unfinished stops use ``extend_end`` — the
 seq len the worker snapshotted — not ``len(origin + output)`` after the
 prefill step appends the sampled token. Request end uses the finished token
 length. An aborted chunked prefill keeps that last snap as the pin, so a
@@ -17,14 +17,15 @@ The worker restores the SWA ring and ratio-2 pending for that stop; see
 full-prefill, which also clears the boundary store. When
 ``SGLANG_DSV41_CSA2_SESSION_DIR`` is set, the miss first spills that
 conversation and may resume a different saved one at a recorded stop.
+A /health_generate dummy on an idle server is not a miss: the pin stays,
+parked with its image in the session store (the dummy clears the store),
+and the next hit loads it back. Without a session directory it drops the pin.
 No ``session_id``. Do not wrap when streaming-session is on.
 """
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional, Sequence
-
-import torch
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
     BOUNDARY_KEEP,
@@ -49,13 +50,14 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
 
 logger = logging.getLogger(__name__)
 
 
 class _VirtualNode:
-    """Sentinel for inc/dec_lock_ref so ChunkCache's no-op lock stays no-op."""
+    """Node of a sticky hit; inc/dec_lock_ref do not pass it to the inner cache."""
 
 
 @dataclass
@@ -149,6 +151,9 @@ class StickyLastSequenceCache(BasePrefixCache):
         self._last_cache_salt: Optional[str] = None
         # Lengths the worker has (or will have) a CSA2 ring/pending snap for.
         self._cuts: list[int] = []
+        # Session key of the pin's image while it is on disk instead of in the
+        # boundary store (a health check ran); see _park_for_health_check.
+        self._parked: Optional[str] = None
 
     @property
     def req_to_token_pool(self):
@@ -203,10 +208,8 @@ class StickyLastSequenceCache(BasePrefixCache):
         return self.inner.match_prefix(params)
 
     def _try_hit(self, params: MatchPrefixParams) -> Optional[MatchResult]:
-        # /health and /health_generate use a 1-token dummy that is never an
-        # exact continuation of a real chat. Dropping the pin on that miss
-        # forces the next Claude Code turn to full-prefill (and can OOM).
         if is_health_check_generate_req(params.req):
+            self._park_for_health_check()
             return None
         key = params.key
         new_ids = key.raw_token_ids()
@@ -250,10 +253,14 @@ class StickyLastSequenceCache(BasePrefixCache):
             # restore, so the pin now describes only the shared prefix.
             self._cuts = [c for c in self._cuts if c <= prefix_len]
             self._last_ids = self._last_ids[:prefix_len]
+        if self._parked is not None:
+            from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+                request_load,
+            )
 
-        device_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :prefix_len
-        ].to(dtype=torch.int64)
+            # The file holds the image and its snaps, so a shorter cut
+            # restores from it too.
+            request_load(self._parked)
 
         event = "exact" if exact else "prefix"
         logger.info(
@@ -265,8 +272,10 @@ class StickyLastSequenceCache(BasePrefixCache):
             max(0, len(new_ids) - prefix_len),
             self._cuts,
         )
+        # The prefix KV is in the restored row, which the allocator reads for a
+        # request that holds its row.
         return MatchResult(
-            device_indices=device_indices,
+            device_prefix_len=prefix_len,
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
             best_match_node=slot.virtual_node,
@@ -314,9 +323,11 @@ class StickyLastSequenceCache(BasePrefixCache):
         is_first = self._slot is None
         if is_first:
             self._slot = _Slot()
+        # The request ran, so the store holds its image.
+        self._parked = None
         self._slot.save_from_req(req, is_first=is_first)
-        self._slot.kv.kv_committed_len = min(len(ids), self._slot.kv.kv_allocated_len)
-        self._slot.kv.cache_protected_len = 0
+        self._slot.kv.commit_finished(len(ids))
+        self._slot.kv.protect_prefix(0)
         self._note_cut(ids)
         self._last_ids = tuple(ids)
         self._last_extra_key = getattr(req, "extra_key", None)
@@ -330,7 +341,7 @@ class StickyLastSequenceCache(BasePrefixCache):
         if ids and not req.finished():
             # Prefill appends the sampled token before this runs. That token
             # is not in the CSA2 image yet; the snap is ``up_to``, which
-            # checkpoint_kv_cache passes as extend_range.end.
+            # checkpoint_kv_cache passes as extend_end.
             self._note_cut(ids, stop=up_to)
             logger.info(
                 "sticky last-seq stop %d tokens cuts=%s",
@@ -345,8 +356,65 @@ class StickyLastSequenceCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
-        return self.inner.evict_for_alloc(params)
+    # Reclaim and window accounting belong to the wrapped cache: the base
+    # class defaults describe a cache with no window sub-pools.
+    def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
+        return self.inner.evict_for_alloc(demand)
+
+    def reclaim_jointly(
+        self, demand: KVDemand, *, windows_first: bool = False
+    ) -> EvictResult:
+        return self.inner.reclaim_jointly(demand, windows_first=windows_first)
+
+    def evict_pool_shortfalls(self, demand: KVDemand) -> EvictResult:
+        return self.inner.evict_pool_shortfalls(demand)
+
+    def reclaim(self, units: dict[str, int]) -> bool:
+        return self.inner.reclaim(units)
+
+    def evict_until(
+        self, params: EvictParams, satisfied: Callable[[], bool]
+    ) -> EvictResult:
+        return self.inner.evict_until(params, satisfied)
+
+    def transfers_in_flight(self) -> bool:
+        return self.inner.transfers_in_flight()
+
+    def window_sub_pools(self):
+        return self.inner.window_sub_pools()
+
+    def window_slots(self):
+        return self.inner.window_slots()
+
+    def window_slot_of(self, sub_pool: str):
+        return self.inner.window_slot_of(sub_pool)
+
+    def window_sub_pool_of_slot(self, slot):
+        return self.inner.window_sub_pool_of_slot(slot)
+
+    def window_available_size(self, sub_pool: str) -> int:
+        return self.inner.window_available_size(sub_pool)
+
+    def window_evictable_size(self, sub_pool: str) -> int:
+        return self.inner.window_evictable_size(sub_pool)
+
+    def window_protected_size(self, sub_pool: str) -> int:
+        return self.inner.window_protected_size(sub_pool)
+
+    def window_checkpoint_interval(self) -> int:
+        return self.inner.window_checkpoint_interval()
+
+    def window_lengths(self):
+        return self.inner.window_lengths()
+
+    def window_retention(self, req):
+        return self.inner.window_retention(req)
+
+    def insert_window_cursors(self, kv: Any):
+        return self.inner.insert_window_cursors(kv)
+
+    def window_reprefill_tail_tokens(self, req=None) -> int:
+        return self.inner.window_reprefill_tail_tokens(req)
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         if isinstance(node, _VirtualNode):
@@ -369,14 +437,8 @@ class StickyLastSequenceCache(BasePrefixCache):
     def full_evictable_size(self):
         return self.inner.full_evictable_size()
 
-    def swa_evictable_size(self):
-        return self.inner.swa_evictable_size()
-
     def full_protected_size(self):
         return self.inner.full_protected_size()
-
-    def swa_protected_size(self):
-        return self.inner.swa_protected_size()
 
     def total_size(self):
         return self.inner.total_size()
@@ -427,14 +489,66 @@ class StickyLastSequenceCache(BasePrefixCache):
             return
         self.inner.sanity_check()
 
+    def _park_for_health_check(self) -> None:
+        """/health_generate on an idle server runs a 1-token dummy from
+        position 0, which clears the CSA2 boundary store. A pin kept past it
+        made the next exact turn resume past the image. Keep the pin and its
+        row, with the image spilled to the session store, until a hit loads it
+        back. /health does not generate (serve script), so it never gets here.
+        """
+        if self._slot is None or self._parked is not None:
+            return
+        if not self._slot.kv.holds_kv:
+            self._clear_pin()
+            return
+        key = self._spill_pin()
+        if key is None:
+            self._drop_slot("health check")
+            return
+        self._parked = key
+        logger.info(
+            "sticky last-seq park %d tokens in session %s for a health check",
+            len(self._last_ids),
+            key[:12],
+        )
+
+    def _spill_pin(self) -> Optional[str]:
+        """Record the pinned conversation; the worker spills its image before
+        the next extend clears the boundary store."""
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            load_pending,
+            remember,
+            request_spill,
+            session_key,
+            sessions_enabled,
+        )
+
+        if not sessions_enabled() or not self._last_ids:
+            return None
+        on_disk = self._parked or load_pending()
+        if on_disk is not None:
+            # The store does not hold this pin's image (parked, or its load has
+            # not reached the worker yet). Spilling now would write the wrong
+            # image under its key; the file already has the right one.
+            return on_disk
+        current = session_key(
+            self._last_ids, self._last_extra_key, self._last_cache_salt
+        )
+        remember(
+            current,
+            self._last_ids,
+            self._cuts,
+            self._last_extra_key,
+            self._last_cache_salt,
+        )
+        request_spill(current)
+        return current
+
     def _match_saved_session(self, params: MatchPrefixParams, new_ids):
         from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
             image_ready,
             list_sessions,
             load_meta,
-            remember,
-            request_spill,
-            session_key,
             sessions_enabled,
         )
 
@@ -442,19 +556,7 @@ class StickyLastSequenceCache(BasePrefixCache):
 
         if not sessions_enabled():
             return None
-        current = None
-        if self._last_ids:
-            current = session_key(
-                self._last_ids, self._last_extra_key, self._last_cache_salt
-            )
-            remember(
-                current,
-                self._last_ids,
-                self._cuts,
-                self._last_extra_key,
-                self._last_cache_salt,
-            )
-            request_spill(current)
+        current = self._spill_pin()
         best_key = None
         best_len = 0
         for record in list_sessions():
@@ -497,6 +599,7 @@ class StickyLastSequenceCache(BasePrefixCache):
         if not self._ensure_slot(prefix_len):
             return None
         request_load(saved_key)
+        self._parked = None
         self._slot.restore_to_req(req)
         self._free_tail(req.kv, prefix_len)
         saved_ids = tuple(int(token) for token in meta.get("ids") or [])
@@ -506,9 +609,6 @@ class StickyLastSequenceCache(BasePrefixCache):
         ]
         self._last_extra_key = meta.get("extra_key")
         self._last_cache_salt = meta.get("cache_salt") or None
-        device_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :prefix_len
-        ].to(dtype=torch.int64)
         logger.info(
             "sticky last-seq event=session pinned=%d new=%d prefix=%d extend=%d cuts=%s",
             len(saved_ids),
@@ -518,7 +618,7 @@ class StickyLastSequenceCache(BasePrefixCache):
             self._cuts,
         )
         return MatchResult(
-            device_indices=device_indices,
+            device_prefix_len=prefix_len,
             last_device_node=self._slot.virtual_node,
             last_host_node=self._slot.virtual_node,
             best_match_node=self._slot.virtual_node,
@@ -542,7 +642,8 @@ class StickyLastSequenceCache(BasePrefixCache):
             flat = indices.reshape(-1)
             start = int(slot.kv.kv_allocated_len)
             row[start:prefix_len] = flat[:need].to(dtype=row.dtype, device=row.device)
-            slot.kv.kv_allocated_len = prefix_len
+            # The row now holds [0, prefix_len); the commit point stays.
+            slot.kv.allocate_spec_decode(prefix_len)
             return True
         return self._alloc_slot(prefix_len)
 
@@ -571,12 +672,8 @@ class StickyLastSequenceCache(BasePrefixCache):
             return False
         row[:prefix_len] = flat[:prefix_len].to(dtype=row.dtype, device=row.device)
         self._slot = _Slot()
-        self._slot.kv = ReqKvInfo(
-            req_pool_idx=idx,
-            kv_committed_len=prefix_len,
-            kv_allocated_len=prefix_len,
-            cache_protected_len=0,
-        )
+        self._slot.kv = ReqKvInfo(req_pool_idx=idx)
+        self._slot.kv.set_row_len(prefix_len)
         return True
 
     def _clear_pin(self) -> None:
@@ -585,6 +682,7 @@ class StickyLastSequenceCache(BasePrefixCache):
         self._last_extra_key = None
         self._last_cache_salt = None
         self._cuts = []
+        self._parked = None
 
     def _pin_aborted_prefix(self, req: Req) -> bool:
         """Keep the last completed chunk when a prefill is aborted.
@@ -592,14 +690,21 @@ class StickyLastSequenceCache(BasePrefixCache):
         ``_last_ids`` is only that prefix. Pinning the full prompt would make
         the next exact hit resume past the CSA2 image.
         """
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import load_pending
+
         ids = list(req.origin_input_ids) + list(req.output_ids)
         pin_len = self._aborted_prefix_len(req, ids)
         if pin_len <= 0:
             return False
+        on_pin = self._slot is not None and req.kv is self._slot.kv
+        if not on_pin or load_pending() != self._parked:
+            # The request ran, so the store holds its image. Aborted before
+            # the worker took the parked load, the pin stays parked.
+            self._parked = None
         if self._slot is not None and req.kv is not self._slot.kv:
             self._release_slot_kv()
         self._free_tail(req.kv, pin_len)
-        req.kv.cache_protected_len = 0
+        req.kv.protect_prefix(0)
         if self._slot is None:
             self._slot = _Slot()
             self._slot.save_from_req(req, is_first=True)
@@ -632,9 +737,8 @@ class StickyLastSequenceCache(BasePrefixCache):
         # The chunk currently on ``chunked_req`` is snapshotted in the worker
         # before the next schedule, which is where this abort runs. Its cut
         # is not in ``_cuts`` yet: stash happens later in the same step.
-        extend_range = getattr(req, "extend_range", None)
-        if extend_range is not None:
-            stop = int(extend_range.end)
+        if req.extend_end is not None:
+            stop = int(req.extend_end)
             if 0 < stop <= limit and stop > best:
                 best = stop
         return best
@@ -667,18 +771,14 @@ class StickyLastSequenceCache(BasePrefixCache):
 
     def _free_tail(self, kv: ReqKvInfo, prefix_len: int) -> None:
         self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
-        kv.kv_allocated_len = prefix_len
-        kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
-        kv.clamp_evicted_seqlens(prefix_len)
+        kv.truncate(prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         target = len(req.origin_input_ids) + finished_len
         if self.page_size > 1 and req.kv.max_evicted_seqlen > target:
             target = (target // self.page_size) * self.page_size
         self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
-        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
-        req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
-        req.kv.clamp_evicted_seqlens(target)
+        req.kv.truncate(target)
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:

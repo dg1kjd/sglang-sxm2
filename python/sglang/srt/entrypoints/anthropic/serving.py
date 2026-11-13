@@ -13,7 +13,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
@@ -48,6 +48,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
+    ResponseFormat,
     StreamOptions,
     Tool,
     ToolChoice,
@@ -238,13 +239,13 @@ class AnthropicServing:
         """
         if chat_request.routed_dp_rank is not None:
             return
+        num_dp_ranks = get_parallel().num_dp_ranks
+        if num_dp_ranks <= 1:
+            return
         if (
             raw_request is not None
             and raw_request.headers.get("x-data-parallel-rank") is not None
         ):
-            return
-        num_dp_ranks = get_parallel().num_dp_ranks
-        if num_dp_ranks <= 1:
             return
 
         session_key = None
@@ -631,6 +632,7 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            "cache_salt": anthropic_request.cache_salt,
             **anthropic_request.pd_routing_kwargs(),
         }
 
@@ -653,15 +655,6 @@ class AnthropicServing:
         chat_request = ChatCompletionRequest(**request_data)
 
         if anthropic_request.thinking is not None:
-            # The protocol layer already enforces SDK shape:
-            #   enabled  -> budget_tokens required (>=1024), display optional
-            #   disabled -> neither budget_tokens nor display allowed
-            #   adaptive -> budget_tokens forbidden, display optional
-            # So by the time we get here ``budget_tokens`` can only be
-            # set on ``enabled``. The local backend has no equivalent
-            # hard-cap knob, so we log a WARNING instead of rejecting —
-            # the Anthropic SDK would have accepted the request and we
-            # mirror that. Operators see the unenforced budget in logs.
             if anthropic_request.thinking.budget_tokens is not None:
                 logger.warning(
                     "Anthropic thinking.budget_tokens=%d is accepted for "
@@ -669,19 +662,15 @@ class AnthropicServing:
                     "equivalent hard-cap knob — the budget is not enforced",
                     anthropic_request.thinking.budget_tokens,
                 )
-            # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
-            # because the local backend has no auto-throttle equivalent.
-            # Anything other than ``disabled`` enables reasoning.
+            # The backend has no adaptive throttle, so ``adaptive`` runs as ``enabled``.
             enabled = anthropic_request.thinking.type != "disabled"
-            if anthropic_request.thinking.display == "omitted":
-                # Anthropic 4.7 spec: keep reasoning ON but hide reasoning
-                # text from the client. The OpenAI streaming pipeline has
-                # no equivalent suppress knob — log so operators can see
-                # the request, then proceed with normal reasoning emission.
+            display = anthropic_request.thinking.display
+            if display in ("omitted", "updates"):
                 logger.warning(
-                    "Anthropic thinking.display='omitted' is accepted for "
+                    "Anthropic thinking.display=%r is accepted for "
                     "SDK compatibility but reasoning text will still be "
-                    "emitted to the client"
+                    "emitted to the client",
+                    display,
                 )
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
@@ -697,6 +686,15 @@ class AnthropicServing:
         # is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
+            if oc.format is not None:
+                chat_request.response_format = ResponseFormat(
+                    type="json_schema",
+                    json_schema={
+                        "name": "response",
+                        "schema": oc.format.schema_,
+                        "strict": True,
+                    },
+                )
             if oc.effort is not None:
                 chat_request.reasoning_effort = oc.effort
             if oc.task_budget is not None:
@@ -740,15 +738,20 @@ class AnthropicServing:
 
                 # Custom tools always have a validated input_schema
                 # (enforced at Pydantic parse time).
+                function = {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": tool.input_schema,
+                }
+                # V100 port: chat templates render the function dict as given, so
+                # an unrequested "strict": false would show up in every prompt.
+                if tool.strict:
+                    function["strict"] = True
                 converted_tools.append(
                     Tool(
                         type="function",
                         defer_loading=tool.defer_loading,
-                        function={
-                            "name": tool.name,
-                            "description": tool.description or "",
-                            "parameters": tool.input_schema,
-                        },
+                        function=function,
                     )
                 )
 
@@ -761,6 +764,9 @@ class AnthropicServing:
         # no tool the model could call. Silently downgrading to "no tool"
         # would deceive the caller, so raise an explicit 400.
         if anthropic_request.tool_choice is not None:
+            chat_request.parallel_tool_calls = (
+                not anthropic_request.tool_choice.disable_parallel_tool_use
+            )
             tc_type = anthropic_request.tool_choice.type
             if tc_type == "none":
                 chat_request.tool_choice = "none"
@@ -830,11 +836,26 @@ class AnthropicServing:
             adapted_request.received_time = received_time
 
             # Get response from OpenAI handler
-            response = await self.openai_serving_chat._handle_non_streaming_request(
+            response = await self.openai_serving_chat._chat_completion_response(
                 adapted_request, processed_request, raw_request
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
+        except HTTPException as e:
+            logger.warning(
+                "Non-streaming request rejected: %s %s", e.status_code, e.detail
+            )
+            return self._error_response(
+                status_code=e.status_code,
+                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                message=_scrub_error_message(str(e.detail), e.status_code),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -880,6 +901,12 @@ class AnthropicServing:
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -1499,6 +1526,7 @@ class AnthropicServing:
                 thinking=request.thinking,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                output_config=request.output_config,
             )
             chat_request = self._convert_to_chat_completion_request(messages_request)
         except asyncio.CancelledError:
@@ -1533,6 +1561,12 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error counting tokens: %s", e)
             return self._error_response(

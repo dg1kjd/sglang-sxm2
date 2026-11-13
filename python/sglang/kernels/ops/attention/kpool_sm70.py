@@ -108,20 +108,20 @@ def _write_pages(
     loc: torch.Tensor,
     quantized: torch.Tensor,
     scale: torch.Tensor,
-    slots_per_page: int,
+    index_page_size: int,
     head_dim: int,
 ) -> None:
     if loc.numel() == 0:
         return
     loc = loc.to(torch.long)
-    page = torch.div(loc, slots_per_page, rounding_mode="floor")
-    slot = loc - page * slots_per_page
-    k_bytes = slots_per_page * head_dim
+    page = torch.div(loc, index_page_size, rounding_mode="floor")
+    slot = loc - page * index_page_size
+    k_bytes = index_page_size * head_dim
     n_pages = buf.shape[0]
     k_view = (
         buf[:, :k_bytes]
         .view(torch.float8_e4m3fn)
-        .view(n_pages, slots_per_page, head_dim)
+        .view(n_pages, index_page_size, head_dim)
     )
     k_view[page, slot] = quantized
     buf.view(torch.float32)[page, k_bytes // 4 + slot] = scale.float()
@@ -167,7 +167,7 @@ def kpool_softmax_rotate_write_cache_sm70(
             loc[mask],
             quantized[mask],
             scale[mask],
-            pool.slots_per_page,
+            pool.index_page_size,
             slot_k.shape[2],
         )
     if return_compressed:
@@ -224,7 +224,7 @@ def kpool_assemble_softmax_rotate_write_cache_sm70(
         loc[mask],
         quantized[mask],
         scale[mask],
-        pool.slots_per_page,
+        pool.index_page_size,
         chunk_k.shape[-1],
     )
 
@@ -290,7 +290,7 @@ def kpool_decode_update_and_maybe_write_cache_sm70(
         positions,
         seq_lens,
         out_cache_loc,
-        pool.slots_per_page,
+        pool.index_page_size,
         round_scale,
     )
 
@@ -332,7 +332,7 @@ def kpool_write_tail_and_maybe_compress_sm70(
         out_cache_loc,
         effective_n_per_batch,
         num_draft_tokens,
-        pool.slots_per_page,
+        pool.index_page_size,
         round_scale,
     )
 

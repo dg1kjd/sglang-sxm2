@@ -62,13 +62,14 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
       -e /opt/deps/flashinfer-sm70
 
 # TurboMind is the one temporarily retained external SM70 component. Fetch
-# only its attributed source directories; never install the 1Cat vLLM or
+# only its attributed source directory (csrc, which holds headers such as
+# csrc/sm70_tile_runtime_signal.cuh); never install the 1Cat vLLM or
 # attention packages and never place a full 1Cat checkout in the image.
 RUN git clone --filter=blob:none --sparse --no-checkout \
       https://github.com/1CatAI/1Cat-vLLM.git \
       /opt/deps/turbomind-sm70-source \
     && git -C /opt/deps/turbomind-sm70-source sparse-checkout set \
-      LICENSE csrc/core csrc/sm70_turbomind csrc/moe \
+      LICENSE csrc \
     && git -C /opt/deps/turbomind-sm70-source checkout --detach \
       6ada86ed64af6d1a7b3cb0f34df237fd86f06d48
 RUN git clone --filter=blob:none https://github.com/NVIDIA/cutlass.git \

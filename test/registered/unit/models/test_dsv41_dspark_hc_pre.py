@@ -7,8 +7,10 @@ import unittest
 
 import torch
 
+from sglang.srt.configs.deepseek_v41 import DeepseekV41Config
 from sglang.srt.models.deepseek_v4_dspark import (
     DSparkAttention,
+    DSparkSm70Attention,
     DeepseekV4ForCausalLMDSpark,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,16 +46,17 @@ class TestDsv41DsparkHcPre(CustomTestCase):
         self.assertIs(DeepseekV4ForCausalLMDSpark.collapse_hc_head(model, x), x)
 
     def test_dspark_attn_matches_mqa_forward_kwargs(self):
-        params = inspect.signature(DSparkAttention.forward).parameters
+        # The sm70 decoder layer calls self_attn(x=..., x_quant=...).
+        params = inspect.signature(DSparkSm70Attention.forward).parameters
         self.assertEqual(list(params)[:4], ["self", "x", "positions", "forward_batch"])
         self.assertIn("x_quant", params)
 
     def test_compute_q_uses_v41_qb_not_head_rmsnorm(self):
+        self.assertFalse(DeepseekV41Config.q_head_norm)
         src = inspect.getsource(DSparkAttention._compute_q)
-        self.assertIn("return q_out", src)
+        self.assertIn("if not self.q_head_norm:", src)
         self.assertIn("fused_rope_inplace", src)
         self.assertIn("self.wq_b", src)
-        self.assertNotIn("npu_rms_norm", src)
 
     def test_sm70_shared_block_flag_is_on_radix_attn(self):
         src = inspect.getsource(DSparkAttention.__init__)

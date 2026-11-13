@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -16,7 +17,12 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
-from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.attention.qsa.mqa import (
+    HAS_TILELANG,
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+    qsa_mqa_prefill_relative,
+)
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
@@ -27,8 +33,9 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
-from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.runtime_context import get_parallel
 
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
@@ -44,6 +51,72 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
+
+
+# Relative prefill scoring is split over the attention-TP ranks only from ~32K
+# context (8192 compressed blocks) and 1024 rows on: below that the scorer is
+# cheap and the all-gather, a cross-rank sync, saves nothing.
+_QSA_PREFILL_SPLIT_MIN_KEYS = 8192
+_QSA_PREFILL_SPLIT_MIN_ROWS = 1024
+
+
+def _qsa_prefill_split_group(rows: int, max_row_keys: Optional[int]):
+    """The attention-TP group that shares relative prefill scoring, or None.
+    Decided from host values only, so every rank of the group takes the same path."""
+    if max_row_keys is None or max_row_keys < _QSA_PREFILL_SPLIT_MIN_KEYS:
+        return None
+    if rows < _QSA_PREFILL_SPLIT_MIN_ROWS or get_is_capture_mode():
+        return None
+    group = get_parallel().attn_tp_group
+    return group if group.world_size > 1 else None
+
+
+def _qsa_relative_block_indices(
+    q: torch.Tensor,
+    compressed_keys: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    max_row_keys: int,
+    block_topk: int,
+) -> torch.Tensor:
+    """Top-k blocks of one row chunk, relative to each row's start."""
+    logits = qsa_mqa_prefill_relative(
+        q, compressed_keys, row_starts, row_ends, max_row_keys
+    )
+    return qsa_fast_topk(
+        logits, torch.zeros_like(row_starts), row_ends - row_starts, topk=block_topk
+    )
+
+
+def _qsa_split_relative_block_indices(
+    group,
+    q: torch.Tensor,
+    compressed_keys: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    max_row_keys: int,
+    block_topk: int,
+    row_chunk_size: int,
+) -> torch.Tensor:
+    """Block indices of all rows, each rank of ``group`` scoring one contiguous
+    share. The indexer is replicated and its inputs are the same on every rank,
+    so each row is scored as it would be on one rank."""
+    rows = q.shape[0]
+    per_rank = -(-rows // group.world_size)
+    lo = min(rows, group.rank_in_group * per_rank)
+    hi = min(rows, lo + per_rank)
+    local = torch.full((per_rank, block_topk), -1, dtype=torch.int32, device=q.device)
+    for start in range(lo, hi, row_chunk_size):
+        end = min(start + row_chunk_size, hi)
+        local[start - lo : end - lo] = _qsa_relative_block_indices(
+            q[start:end],
+            compressed_keys,
+            row_starts[start:end],
+            row_ends[start:end],
+            max_row_keys,
+            block_topk,
+        )
+    return group.all_gather(local, dim=0)[:rows]
 
 
 class QSAIndexer(MultiPlatformOp):
@@ -126,6 +199,7 @@ class QSAIndexer(MultiPlatformOp):
 
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
         """Whether the fused indexer-prep kernels support this configuration."""
+        cache = getattr(self.rotary_emb, "cos_sin_cache", None)
         return (
             tensor.is_cuda
             and tensor.dtype in (torch.bfloat16, torch.float16)
@@ -133,9 +207,17 @@ class QSAIndexer(MultiPlatformOp):
             and self.rotary_emb.rotary_dim % 2 == 0
             and not getattr(self.rotary_emb, "mrope_interleaved_glm", False)
             and len(getattr(self.rotary_emb, "mrope_section", None) or ()) in (0, 3)
-            and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
-            and self.rotary_emb.cos_sin_cache.is_cuda
-            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and cache is not None
+            and cache.is_cuda
+            and (
+                cache.dtype == torch.float32
+                # The shared attention RoPE turns its cache into fp16 on its first call;
+                # eager RoPE rounds cos/sin to fp16 anyway, so the kernels stay bit-identical.
+                or (
+                    cache.dtype == tensor.dtype == torch.float16
+                    and torch.cuda.get_device_capability(tensor.device) == (7, 0)
+                )
+            )
         )
 
     def _rope_axis_map(self, device) -> torch.Tensor:
@@ -181,16 +263,10 @@ class QSAIndexer(MultiPlatformOp):
             and qk.shape[0] > 0
             and self._use_fused_prep(qk)
         ):
-            from sglang.srt.layers.attention.qsa_indexer import (
+            from sglang.kernels.ops.attention.qsa_indexer import (
                 qsa_index_q_norm_rope_store,
             )
 
-            if not get_is_capture_mode() and hasattr(
-                self.rotary_emb, "_ensure_cos_sin_cache_length"
-            ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -246,7 +322,7 @@ class QSAIndexer(MultiPlatformOp):
         The member source defaults to the pending ring; extend forwards pass
         this forward's packed keys/rope instead (members are chunk-local).
         """
-        from sglang.srt.layers.attention.qsa_indexer import (
+        from sglang.kernels.ops.attention.qsa_indexer import (
             qsa_index_k_compress_store,
         )
 
@@ -281,6 +357,7 @@ class QSAIndexer(MultiPlatformOp):
             sequence_lengths=metadata.sequence_lengths,
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
+            ring_size=metadata.token_to_kv_pool.qsa_ring_size,
             is_extend=is_extend,
         )
 
@@ -292,6 +369,7 @@ class QSAIndexer(MultiPlatformOp):
             group_end_positions=group_end_positions,
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
+            ring_size=metadata.token_to_kv_pool.qsa_ring_size,
         )
 
     def update_key_state_and_compress(
@@ -354,7 +432,7 @@ class QSAIndexer(MultiPlatformOp):
                 )
         else:
             # Paged eager rows (speculative fallback) complete at most one
-            # group each; its members are exactly the pending ring window.
+            # group each; the pending ring still holds all of its members.
             group_locs = metadata.compress_group_ring_locs
             if group_locs is None:
                 group_locs = self._group_ring_slots(
@@ -419,7 +497,11 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-    def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    def apply_rope(
+        self,
+        positions: torch.Tensor,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
@@ -428,14 +510,8 @@ class QSAIndexer(MultiPlatformOp):
         )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if not get_is_capture_mode() and hasattr(
-            self.rotary_emb, "_ensure_cos_sin_cache_length"
-        ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
-
-        # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
-        # multimodal positions.  Its public cache view repeats cos/sin to the
-        # full rotary width; apply_rotary_emb consumes one half.
+        # position_cos/position_sin repeat cos/sin to the full rotary width;
+        # apply_rotary_emb consumes one half.
         self.rotary_emb.get_cos_sin_with_position(positions)
         rotary_dim = self.rotary_emb.rotary_dim
         half_rotary_dim = rotary_dim // 2
@@ -461,7 +537,21 @@ class QSAIndexer(MultiPlatformOp):
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
+        max_row_keys: Optional[int] = None,
+        split_group=None,
     ) -> torch.Tensor:
+        """Top-k token selection for packed prefill rows.
+
+        ``max_row_keys`` (host int, the longest request's compressed-block count)
+        switches scoring to request-relative logits: [rows, max_row_keys] instead
+        of [rows, all compressed keys of the batch]. The latter caps a chunk at
+        a few dozen rows once a batch holds many long prefixes, so the scoring
+        kernel ran as thousands of one-CTA launches. Selection is unchanged: the
+        top-k reads only each row's own section and returns indices relative to
+        the row's start either way.
+
+        ``split_group`` (relative scoring only) scores a share of the rows on each
+        of its ranks and all-gathers the block indices."""
         rows = q.shape[0]
         output = torch.empty(
             (rows, self.token_topk + self.compress_ratio - 1),
@@ -471,18 +561,48 @@ class QSAIndexer(MultiPlatformOp):
         if rows == 0:
             return output
 
-        row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows, compressed_keys.shape[0], q.shape[1]
+        relative = (
+            max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG
         )
+        row_chunk_size = _qsa_prefill_row_chunk_size(
+            rows,
+            max_row_keys if relative else compressed_keys.shape[0],
+            q.shape[1],
+        )
+        gathered = None
+        if split_group is not None and relative and compressed_keys.shape[0] > 0:
+            gathered = _qsa_split_relative_block_indices(
+                split_group,
+                q,
+                compressed_keys,
+                row_starts,
+                row_ends,
+                max_row_keys,
+                self.block_topk,
+                row_chunk_size,
+            )
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
-            if compressed_keys.shape[0] == 0:
+            if gathered is not None:
+                block_indices = gathered[chunk_slice]
+                logits = None
+            elif compressed_keys.shape[0] == 0:
                 block_indices = torch.full(
                     (row_end - row_start, self.block_topk),
                     -1,
                     dtype=torch.int32,
                     device=q.device,
+                )
+                logits = None
+            elif relative:
+                block_indices = _qsa_relative_block_indices(
+                    q[chunk_slice],
+                    compressed_keys,
+                    row_starts[chunk_slice],
+                    row_ends[chunk_slice],
+                    max_row_keys,
+                    self.block_topk,
                 )
                 logits = None
             else:
@@ -520,20 +640,27 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
     ) -> torch.Tensor:
+        # ordered_topk writes 0..length-1 for rows that fit k without reading their
+        # scores, and never uses a score past a row's length.
+        use_fast_topk = (
+            q.is_cuda
+            and self.block_topk == 512
+            and not is_batch_invariant_mode_enabled()
+        )
         logits = qsa_mqa_decode(
             q,
             compressed_cache,
             compressed_page_table,
             compressed_lengths,
             max_model_len,
+            min_scored_len=self.block_topk if use_fast_topk else 0,
         )
-        if logits.is_cuda and self.block_topk == 512:
-            # Decode rows start at zero, so lengths are the compressed lengths
-            # themselves; calling the JIT kernel directly skips the zeros_like
-            # fill + subtract of the generic path.
-            from sglang.srt.layers.elementwise.fast_topk import fast_topk
+        if use_fast_topk:
+            # Decode rows start at zero, so compressed lengths double as row lengths;
+            # skip the generic zero-fill + subtract.
+            from sglang.kernels.ops.attention.ordered_topk import ordered_topk
 
-            block_indices = fast_topk(
+            block_indices = ordered_topk(
                 logits,
                 compressed_lengths.to(torch.int32),
                 topk=self.block_topk,
@@ -571,7 +698,8 @@ class QSAIndexer(MultiPlatformOp):
         exactly as without CP (every rank ends up with the complete compressed-K
         cache). Selection then scores the local rows against all compressed
         blocks of their request, position-driven, so the output rows line up
-        with the local query rows the sparse attention consumes."""
+        with the local query rows the sparse attention consumes.
+        """
         strategy = get_cp_strategy()
         if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
             strategy_name = strategy.name if strategy is not None else "none"
@@ -598,7 +726,9 @@ class QSAIndexer(MultiPlatformOp):
         # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
         # the ring store until raw local K has been gathered into global order.
         q, token_k, _ = self.project_qk(
-            hidden_states, positions, pool=indexer_metadata.token_to_kv_pool
+            hidden_states,
+            positions,
+            pool=indexer_metadata.token_to_kv_pool,
         )
         # Raw keys of all new tokens in global packed order: the ring store
         # and compression use the global write plan unchanged. Cached prefix
@@ -635,6 +765,9 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             local_logical,
             row_sequence_lengths,
+            max_row_keys=indexer_metadata.prefill_max_row_keys(
+                getattr(forward_batch, "seq_lens_cpu", None)
+            ),
         )
 
     def _forward_impl(
@@ -777,6 +910,9 @@ class QSAIndexer(MultiPlatformOp):
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()
         )
+        max_row_keys = indexer_metadata.prefill_max_row_keys(
+            getattr(forward_batch, "seq_lens_cpu", None)
+        )
         return self.select_prefill_tokens(
             q,
             compressed_keys,
@@ -784,6 +920,8 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+            max_row_keys=max_row_keys,
+            split_group=_qsa_prefill_split_group(num_valid_tokens, max_row_keys),
         )
 
     def forward_cuda(

@@ -5,13 +5,14 @@ import functools
 import math
 import warnings
 from functools import lru_cache, partial
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang._lazy_import import LazyImport
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
 )
@@ -50,9 +51,13 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
-
     from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module.
+    cudnn_batch_prefill_with_kv_cache = LazyImport(
+        "flashinfer.prefill", "cudnn_batch_prefill_with_kv_cache"
+    )
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
@@ -93,7 +98,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -142,6 +147,11 @@ class VisionAttentionMetadata:
     seq_lens: torch.Tensor
     max_seqlen: int
 
+    # Cumulative sequence ends for Ascend FIA; excludes the leading zero.
+    # Read-only by convention; prepared once per vision forward on the CPU
+    # so per-block NPU->CPU copies of the same metadata can be skipped.
+    actual_seq_lengths_cpu: Optional[list[int]] = None
+
     # flashinfer_cudnn specific (optional)
     packed_indptrs: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
@@ -153,6 +163,7 @@ def prepare_vision_attention_metadata(
     device: torch.device,
     *,
     max_seqlen: Optional[int] = None,
+    actual_seq_lengths_cpu: Optional[list[int]] = None,
     packed_indptrs: Optional[torch.Tensor] = None,
     sequence_lengths: Optional[torch.Tensor] = None,
     flashinfer_max_seqlen: Optional[int] = None,
@@ -167,6 +178,7 @@ def prepare_vision_attention_metadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
         max_seqlen=max_seqlen,
+        actual_seq_lengths_cpu=actual_seq_lengths_cpu,
         packed_indptrs=packed_indptrs,
         sequence_lengths=sequence_lengths,
         flashinfer_max_seqlen=flashinfer_max_seqlen,
@@ -370,6 +382,54 @@ class VisionSdpaAttention(nn.Module):
 
         return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
 
+    def _maskless_seq_lens(
+        self, s: int, bsz: int, cu_seqlens: Optional[torch.Tensor]
+    ) -> Optional[List[int]]:
+        """Per-sequence lengths when the patch mask would be all-True or block-diagonal,
+        so one unmasked SDPA per sequence is equivalent; None when the mask is needed.
+        """
+        if (
+            cu_seqlens is None
+            or bsz != 1
+            or self.softmax_in_single_precision
+            or self.num_kv_heads != self.num_heads
+        ):
+            return None
+        cu = cu_seqlens.tolist()
+        if cu[0] != 0 or cu[-1] != s or (len(cu) > 2 and not self.flatten_batch):
+            return None
+        seq_lens = [end - start for start, end in zip(cu[:-1], cu[1:]) if end > start]
+        return seq_lens or None
+
+    def _sdpa_per_sequence(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_lens: List[int]
+    ) -> torch.Tensor:
+        # [s, h, head_size] --> [1, h, s, head_size]
+        q, k, v = (
+            x.reshape(-1, self.num_heads, self.head_size).transpose(0, 1)[None]
+            for x in (q, k, v)
+        )
+        output = torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    qi,
+                    ki,
+                    vi,
+                    dropout_p=self.dropout,
+                    is_causal=False,
+                    scale=self.scale,
+                )
+                for qi, ki, vi in zip(
+                    q.split(seq_lens, dim=2),
+                    k.split(seq_lens, dim=2),
+                    v.split(seq_lens, dim=2),
+                )
+            ],
+            dim=2,
+        )
+        # [1, h, s, head_size] --> [s, h, head_size]
+        return output[0].transpose(0, 1).reshape(-1, self.num_heads, self.head_size)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -392,6 +452,12 @@ class VisionSdpaAttention(nn.Module):
         assert q.dim() == 3, q.shape
 
         s = q.shape[0] // bsz
+
+        # A mask, even an all-True one, keeps SDPA off its flash kernels.
+        if attention_mask is None:
+            seq_lens = self._maskless_seq_lens(s=s, bsz=bsz, cu_seqlens=cu_seqlens)
+            if seq_lens is not None:
+                return self._sdpa_per_sequence(q=q, k=k, v=v, seq_lens=seq_lens)
 
         # [b, 1, s, s]
         if attention_mask is None:
@@ -514,6 +580,154 @@ class VisionTritonAttention(nn.Module):
             sm_scale=softmax_scale,
         )
 
+        return output
+
+
+_TILELANG_V100_HEAD_DIM = 128
+_tilelang_v100_varlen = None
+_tilelang_v100_varlen_failed = False
+
+
+def _load_tilelang_v100_varlen():
+    """The dense TileLang varlen attention for Volta, or None if it can't load."""
+    global _tilelang_v100_varlen, _tilelang_v100_varlen_failed
+    if _tilelang_v100_varlen is None and not _tilelang_v100_varlen_failed:
+        try:
+            # The kernel lives with MiniMax H3, its first user.
+            from sglang.multimodal_gen.runtime.layers.attention.backends.tilelang_fa_v100 import (
+                tilelang_flash_attn_varlen,
+            )
+
+            _tilelang_v100_varlen = tilelang_flash_attn_varlen
+        except Exception:
+            _tilelang_v100_varlen_failed = True
+            warnings.warn(
+                "TileLang V100 vision attention is unavailable; using triton_attn."
+            )
+    return _tilelang_v100_varlen
+
+
+class VisionTileLangV100Attention(nn.Module):
+    """Dense TileLang attention for Volta (SM70), without a causal mask.
+
+    Runs the FP16 varlen kernel that MiniMax H3 uses. The kernel is built for
+    head size 128, so smaller heads are zero-padded: the padding adds nothing to
+    the Q.K scores and produces zero output columns, which are cut off again.
+    The softmax scale stays that of the real head size. Each sequence is one
+    kernel call, so a single compiled kernel serves any number of images.
+
+    Inputs the kernel cannot take (not FP16, grouped KV heads, a head larger
+    than 128, CUDA-graph mode, a failed build) go to the Triton backend.
+    """
+
+    def __init__(self, num_heads: Optional[int] = None, **kwargs):
+        super().__init__()
+        self.triton_fallback = VisionTritonAttention(**kwargs)
+        if num_heads is not None and get_device_capability() == (7, 0):
+            self._build_kernel(num_heads)
+
+    @staticmethod
+    def _build_kernel(num_heads: int) -> None:
+        # Compile at start-up; otherwise the first image request waits for it.
+        global _tilelang_v100_varlen_failed
+        if _load_tilelang_v100_varlen() is None:
+            return
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.tilelang_fa_v100 import (
+                _get_dense_varlen_kernel,
+            )
+
+            _get_dense_varlen_kernel(
+                batch=1, heads=num_heads, dim=_TILELANG_V100_HEAD_DIM
+            )
+        except Exception:
+            _tilelang_v100_varlen_failed = True
+            warnings.warn(
+                "TileLang V100 vision attention failed to build; using triton_attn."
+            )
+
+    @staticmethod
+    def _kernel_for(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        if (
+            _tilelang_v100_varlen_failed
+            or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+            or not q.is_cuda
+            or q.dtype != torch.float16
+            or k.dtype != torch.float16
+            or v.dtype != torch.float16
+            or q.ndim != 3
+            or k.shape != q.shape
+            or v.shape != q.shape
+            or q.shape[-1] > _TILELANG_V100_HEAD_DIM
+            or torch.cuda.get_device_capability(q.device) != (7, 0)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        return _load_tilelang_v100_varlen()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | list | None,
+        bsz: int,
+        seq_len: int,
+        softmax_scale: Optional[float] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        kernel = self._kernel_for(q, k, v)
+        if kernel is None:
+            return self.triton_fallback(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                bsz,
+                seq_len,
+                softmax_scale=softmax_scale,
+                forward_metadata=forward_metadata,
+                **kwargs,
+            )
+
+        if forward_metadata is not None:
+            cu_seqlens_gpu = forward_metadata.cu_seqlens
+        else:
+            cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+
+        head_size = q.shape[-1]
+        if softmax_scale is None:
+            softmax_scale = head_size**-0.5
+        pad = _TILELANG_V100_HEAD_DIM - head_size
+        if pad:
+            q, k, v = (F.pad(t, (0, pad)) for t in (q, k, v))
+
+        output = torch.empty(
+            (q.shape[0], q.shape[1], head_size), dtype=q.dtype, device=q.device
+        )
+        bounds = cu_seqlens_gpu.tolist()
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if stop <= start:
+                continue
+            length = stop - start
+            unit_seqlens = torch.tensor(
+                [0, length], dtype=torch.int32, device=q.device
+            )
+            output[start:stop] = kernel(
+                q[start:stop],
+                k[start:stop],
+                v[start:stop],
+                cu_seqlens=unit_seqlens,
+                max_seqlen=length,
+                softmax_scale=softmax_scale,
+            )[..., :head_size]
         return output
 
 
@@ -863,9 +1077,14 @@ class VisionAscendAttention(nn.Module):
         if forward_metadata is not None:
             # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
             # not per-sequence lengths in forward_metadata.seq_lens.
-            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = cu[1:].to(torch.int32)
+            if forward_metadata.actual_seq_lengths_cpu is not None:
+                # Prepared once per vision forward on the CPU; reuse it in
+                # every block instead of copying cu_seqlens back per block.
+                seq_len_arg = forward_metadata.actual_seq_lengths_cpu
+            else:
+                cu = forward_metadata.cu_seqlens.to("cpu")
+                seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
@@ -881,7 +1100,8 @@ class VisionAscendAttention(nn.Module):
 
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
-        seq_len_arg = seq_len_arg.tolist()
+        if isinstance(seq_len_arg, torch.Tensor):
+            seq_len_arg = seq_len_arg.tolist()
 
         total_tokens = int(seq_len_arg[-1])
 
@@ -960,6 +1180,7 @@ class VisionAMXAttention(nn.Module):
         cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
+        softmax_scale: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -990,6 +1211,7 @@ class VisionAMXAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
+            sm_scale=softmax_scale,
         )
 
         return output
@@ -1046,6 +1268,7 @@ class VisionIntelXPUAttention(nn.Module):
 
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
+    "tilelang_fa_v100": VisionTileLangV100Attention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
     "fa4": VisionFlash4Attention,
@@ -1058,7 +1281,9 @@ QKV_BACKEND_IMPL = {
 
 # backends that read q/k/v through explicit per-dim strides, and so accept the
 # strided views of the packed qkv projection output instead of dense copies
-STRIDED_QKV_BACKENDS = frozenset({"fa3", "fa4", "triton_attn", "amx_attn"})
+STRIDED_QKV_BACKENDS = frozenset(
+    {"fa3", "fa4", "triton_attn", "tilelang_fa_v100", "amx_attn"}
+)
 
 
 class VisionAttention(nn.Module):
@@ -1196,8 +1421,7 @@ class VisionAttention(nn.Module):
                 total_num_kv_heads=num_dummy_heads + num_kv_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="replicated" if use_data_parallel else "attn_tp",
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
@@ -1206,8 +1430,7 @@ class VisionAttention(nn.Module):
                 output_size=3 * self.dummy_dim,
                 bias=qkv_bias,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="replicated" if use_data_parallel else "attn_tp",
                 prefix=add_prefix("qkv_proj", prefix),
             )
         # TODO: this layer shards over attention TP but reduces over the full TP
@@ -1226,8 +1449,7 @@ class VisionAttention(nn.Module):
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             prefix=add_prefix("proj", prefix),
             use_dp_attention_reduce=use_dp_attention_reduce,
         )
@@ -1283,6 +1505,7 @@ class VisionAttention(nn.Module):
         Platform defaults:
         - CUDA (Hopper SM90): "fa3"
         - CUDA (Blackwell SM100/SM103): "fa4"
+        - CUDA (Volta SM70): "tilelang_fa_v100", unless vision CUDA graphs are on
         - CUDA (other): "triton_attn"
         - Ascend NPU: "ascend_attn"
         - Other platforms: device-specific optimized backend or "sdpa"
@@ -1300,11 +1523,15 @@ class VisionAttention(nn.Module):
         elif passed_backend is not None:
             backend = passed_backend
         elif is_cuda():
-            major, _ = get_device_capability()
+            major, minor = get_device_capability()
+            # The vision CUDA-graph runner prepares buffers for triton_attn only.
+            vit_cuda_graph = envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
             if major == 9:
                 backend = "fa3"
             elif major == 10:
                 backend = "fa4"
+            elif (major, minor) == (7, 0) and not vit_cuda_graph:
+                backend = "tilelang_fa_v100"
             else:
                 backend = "triton_attn"
         elif _is_npu:

@@ -226,6 +226,20 @@ changing `--mem-fraction-static`, the prefill chunk size, or the KV dtype. The
 scripts take Python from `SGLANG_V100_VENV` (default `~/sglang-v100-venv`); if
 that has none, from the active venv or conda env.
 
+Raise the locked-memory limit before serving Qwen3.8-Flash-Next. Its host KV
+tier (about 12 GiB per GPU) is pinned and then locked with `mlock`, and the
+default limit of 8 MiB refuses the lock. The engine still runs (it logs
+`mlock of a ... pinned host buffer failed`), but the kernel then keeps scanning
+those pages when memory gets tight. Once, as root, then log in again:
+
+```bash
+printf '%s soft memlock unlimited\n%s hard memlock unlimited\n' "$USER" "$USER" \
+  | sudo tee /etc/security/limits.d/90-sglang-memlock.conf
+ulimit -l      # in the new login: unlimited
+```
+
+The systemd unit and the Docker services set this themselves.
+
 First launch compiles the sm70 JIT kernels; expect several minutes, with every
 rank compiling at once. Later launches reuse `~/.cache/sglang/jit/sm70`.
 

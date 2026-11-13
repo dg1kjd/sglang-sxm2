@@ -25,8 +25,12 @@ void down(
       reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0 &&
           reinterpret_cast<uintptr_t>(inject.data_ptr()) % 16 == 0,
       "Projection operands must be 16-byte aligned");
-  LaunchKernel(324, 256, dev.unwrap())(
-      sm70_hc_batch::down<M, 256, true>,
+  LaunchKernel(
+      sm70_hc_batch::kDownGrid<M> + 4 * (M / sm70_hc_batch::kTokensPerCta<M>),
+      sm70_hc_batch::kDownThreads,
+      dev.unwrap())(
+      sm70_hc_batch::
+          down<sm70_hc_batch::kTokensPerCta<M>, M / sm70_hc_batch::kTokensPerCta<M>, sm70_hc_batch::kDownRows<M>, true>,
       static_cast<const half*>(x.data_ptr()),
       static_cast<const half*>(w.data_ptr()),
       static_cast<half*>(o.data_ptr()),

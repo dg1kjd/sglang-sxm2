@@ -271,9 +271,10 @@ Five seconds becomes 124 frames, which is 5.167 seconds in the file. The
 soundtrack follows that same duration. Frame rate in the file is 24.
 
 **`num_inference_steps`.** 50 is the setting the checkpoint is built around.
-The minimum is 2. The sampler evaluates the model `steps - 1` times, so 50
-steps is 49 evaluations. Fewer steps finish sooner and resolve less of the
-image.
+The minimum is 1. The sampler evaluates the model once per step, so 50 steps
+is 50 evaluations. Builds before the 2026-11 upstream sync ran one evaluation
+fewer (50 steps was 49); send one step less to repeat a clip made with such a
+build. Fewer steps finish sooner and resolve less of the image.
 
 **`flow_shift` and `audio_flow_shift`.** Defaults are 12.0 and 3.0, and
 those are the shifts to use. Both have to be positive finite numbers when
@@ -300,7 +301,10 @@ single positive branch, and the delivery format is the resolved canvas at
 ## Time
 
 On 4× V100-32GB with the W4 recipe and `flow_shift` 12, measured 2026-09-28.
-A step is one denoising evaluation (`num_inference_steps - 1` of them).
+A step is one denoising evaluation. These runs predate the 2026-11 upstream
+sync: the Steps column is the requested `num_inference_steps`, and the server
+then ran one evaluation fewer (49 for 50). Today the same request runs one
+more step.
 
 | Clip | Steps | Step time |
 |---|---:|---:|
@@ -326,4 +330,10 @@ That is specific to this port. A Hopper or Blackwell box serving the same
 checkpoint in bf16 is a different numeric path.
 
 Leave `quality` unset. The default is `lossless`, which does not enable the
-H200 cache. `quality=high` is rejected on this server.
+H200 cache. On other GPUs `lossless` also selects a fused RMSNorm + AdaLN
+kernel and a faster VAE decoder, both of which round differently from the
+reference. Neither runs here: the fused kernel needs a bf16 residual stream
+(this port keeps it in fp32), and the VAE fast path is limited to SM80 and
+newer. So on V100, without a LoRA adapter, `lossless` and `exact` take the
+same numeric path.
+`quality=high` is rejected on this server.

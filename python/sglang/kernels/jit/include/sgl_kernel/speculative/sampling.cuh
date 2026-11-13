@@ -134,6 +134,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   DType u = coin * sum_relu_q_minus_p;
 
   DType aggregate_relu_q_minus_p(0);
+  // Each thread's fallback candidate; FlashInfer reduces it only if the scan selects nothing.
+  int last_valid_index = -1;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(DType(0));
     p_vec.fill(DType(0));
@@ -151,8 +153,26 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], DType(0));
     }
 
-    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
-        i, d, [&](DType x) { return x > 0; }, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p, &temp_storage);
+    const auto is_positive = [&](DType x) { return x > 0; };
+    // FlashInfer before 0.7 has no last_valid_index parameter and keeps the
+    // fallback candidate in temp_storage itself.
+    if constexpr (requires {
+                    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
+                        i,
+                        d,
+                        is_positive,
+                        u,
+                        relu_q_minus_p_vec,
+                        aggregate_relu_q_minus_p,
+                        last_valid_index,
+                        &temp_storage);
+                  }) {
+      DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
+          i, d, is_positive, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p, last_valid_index, &temp_storage);
+    } else {
+      DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
+          i, d, is_positive, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p, &temp_storage);
+    }
     if (aggregate_relu_q_minus_p > u) {
       break;
     }

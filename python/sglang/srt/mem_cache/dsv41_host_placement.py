@@ -167,6 +167,39 @@ def read_huge_pages() -> tuple[int, int]:
     return total, size_kb
 
 
+THP_DIR = "/sys/kernel/mm/transparent_hugepage"
+
+
+def thp_mode(knob: str) -> str:
+    """Active mode of a transparent_hugepage sysfs knob ("" if unreadable)."""
+    try:
+        with open(f"{THP_DIR}/{knob}") as f:
+            m = re.search(r"\[(\w+)\]", f.read())
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+def choose_engram_host_layout(requested: str) -> str:
+    """SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT as "shared" or "private"; "auto"
+    picks shared when the host has a hugetlb pool or shmem THP, else private when
+    anonymous THP is on, else shared without huge pages."""
+    if requested != "auto":
+        return requested
+    total, size_kb = read_huge_pages()
+    if (
+        envs.SGLANG_ENABLE_DSV41_ENGRAM_HUGETLB.get()
+        and total > 0
+        and size_kb >= 2048
+    ):
+        return "shared"
+    if thp_mode("shmem_enabled") in ("advise", "always", "within_size", "force"):
+        return "shared"
+    if thp_mode("enabled") in ("madvise", "always"):
+        return "private"
+    return "shared"
+
+
 def read_numa_nodes(*, documented_fallback: bool = False) -> dict[int, NumaNodeMem]:
     """MemTotal/MemFree per NUMA node from sysfs.
 

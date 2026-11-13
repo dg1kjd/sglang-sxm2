@@ -157,6 +157,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kCUDA, &moe_sum);
 
+  m.def("apply_gguf_moe_weights(Tensor! outputs, Tensor weights, Tensor ids) -> ()");
+  m.impl("apply_gguf_moe_weights", torch::kCUDA, &apply_gguf_moe_weights);
+
   // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the CUDA gate/topk path
   // now routes through the unified Triton router
   // (python/sglang/kernels/ops/moe/moe_fused_gate.py).
@@ -181,16 +184,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
 
 #if !defined(SGL_KERNEL_V100_ONLY)
-  // DeepSeek-V4 fused norm + rope, fused qk norm rope — uses sm80+ BF16 intrinsics
-  m.def(
-      "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
-  m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
-
-  m.def(
-      "dsv4_fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
-      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
-  m.impl("dsv4_fused_k_norm_rope_flashmla", torch::kCUDA, &dsv4_fused_k_norm_rope_flashmla);
-
+  // DeepSeek-V4 fused indexer rope + hadamard + quant
   m.def(
       "dsv4_fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor! q_fp8, Tensor weight, "
       "Tensor! weights_out, float weight_scale, Tensor freqs_cis, Tensor positions) -> ()");
@@ -340,7 +334,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
 
   m.def("ggml_moe_get_block_size(int type) -> int");
-  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+  m.impl("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
   /*
    * From csrc/mamba

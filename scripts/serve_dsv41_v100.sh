@@ -27,13 +27,13 @@ export FLASHINFER_DISABLE_VERSION_CHECK=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 MODEL="${MODEL_PATH:-$HOME/models/DeepSeek-V4.1-Flash}"
-export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
+# Engram tables in host memory, one private row range per rank ("replication":
+# "none"). "per_node" is one shared memfd copy, but each of the TP ranks maps the
+# full table and the OOM killer sums those mappings.
+DSV41_ENGRAM_CONFIG="${DSV41_ENGRAM_CONFIG:-{\"placement\": \"cpu\", \"replication\": \"none\"}}"
 # Engram tables and the expert spill go to the GPUs' NUMA node, found at startup.
 # SGLANG_DSV41_ENGRAM_NUMA_NODE / SGLANG_DSV41_EXPERT_SPILL_NUMA_NODES override.
 export SGLANG_DSV41_ENGRAM_NUMA_SPLIT=1
-# Private shards: each rank maps 1/TP of Engram. Shared memfd is one physical
-# copy but TP RSS mappings of the full table, which the OOM killer sums.
-export SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT="${SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT:-private}"
 # Do not posix_fadvise(DONTNEED) the 476 GiB checkpoint; this array writes
 # swap at ~80 MB/s once page cache is gone.
 export SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE="${SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE:-0}"
@@ -201,6 +201,7 @@ exec "${NSYS_WRAP[@]}" python -m sglang.launch_server \
   --max-prefill-tokens "${SGLANG_DSV41_CONTEXT_LEN}" \
   --pre-warm-nccl \
   --warmups dsv41_chunk,sampling \
+  --engram-config "${DSV41_ENGRAM_CONFIG}" \
   "${GRAPH_FLAGS[@]}" \
   --reasoning-parser deepseek-v41 \
   --tool-call-parser deepseekv41 \

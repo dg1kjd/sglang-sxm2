@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 
 import torch
-from sglang.kernels.sm70_paths import sm70_csrc
+from sglang.kernels.sm70_paths import sm70_csrc, sm70_jit_build_dir
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -68,20 +68,25 @@ def _load_sm70_cuda_decode_ops():
         return None
     from torch.utils.cpp_extension import load_inline
 
-    build_directory = os.environ.get(
-        "SGLANG_V100_DECODE_CUDA_BUILD_DIR", "/tmp/sglang_sm70_longctx_decode"
+    source = _SRC_PATH.read_text()
+    cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    build_directory = sm70_jit_build_dir(
+        os.environ.get(
+            "SGLANG_V100_DECODE_CUDA_BUILD_DIR", "/tmp/sglang_sm70_longctx_decode"
+        ),
+        source,
+        cuda_cflags,
     )
-    os.makedirs(build_directory, exist_ok=True)
     try:
         _EXT = load_inline(
             name="sglang_sm70_longctx_decode_v100",
             cpp_sources="",
-            cuda_sources=_SRC_PATH.read_text(),
+            cuda_sources=source,
             functions=None,
             is_python_module=True,
             verbose=False,
             build_directory=build_directory,
-            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+            extra_cuda_cflags=cuda_cflags,
         )
     except Exception:  # pragma: no cover - build/environment failures
         logger.exception("SM70 CUDA decode partial failed to build")
@@ -142,15 +147,15 @@ def sm70_cuda_qsa_prefill(
     seq_lens,
     softmax_scale,
 ):
-    """Run exact-shape QSA chunk-prefill directly from the E5M2 cache."""
+    """Run exact-shape QSA chunk-prefill directly from the E5M2 or FP16 cache."""
     ext = _load_sm70_cuda_decode_ops()
     if ext is None:
         raise RuntimeError("SM70 CUDA QSA prefill extension is unavailable.")
     output = torch.empty_like(q)
     ext.sm70_qsa_prefill(
         q.contiguous(),
-        k_cache.view(torch.uint8).contiguous(),
-        v_cache.view(torch.uint8).contiguous(),
+        _qsa_cache_view(k_cache),
+        _qsa_cache_view(v_cache),
         req_to_token.to(dtype=torch.int32).contiguous(),
         req_indices.to(dtype=torch.int32).contiguous(),
         indices.to(dtype=torch.int32).contiguous(),

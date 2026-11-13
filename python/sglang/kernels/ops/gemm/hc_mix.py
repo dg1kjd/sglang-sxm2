@@ -31,8 +31,8 @@ barriers or atomics.  It covers ``1 <= M <= _SM70_MAX_MIX_ROWS`` so it also
 runs in MTP verify, which is where most decode time goes: at bs=1 a decode
 round is 96 mix calls at M=4 (48 layers x 2 modules) against 6 at M=1.
 The exact FP16 shape uses native CUDA with vector loads and four parallel
-branch reductions per warp. Two/four-row verification reuses each weight
-load across the rows. SGLANG_SM70_HC_NATIVE=0 selects the previous paths;
+branch reductions per warp. Each CTA keeps its slice of one or two token
+rows in FP32 registers across several output rows. SGLANG_SM70_HC_NATIVE=0 selects the previous paths;
 SGLANG_SM70_MTP_HC=0 disables only the batched native path.
 """
 
@@ -42,6 +42,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.environ import envs
 
 _FUSED_MIX_MAX_ROWS = 16
@@ -118,7 +119,9 @@ def _sm70_hc_down_gemv_rows_kernel(
 # Above 4 rows the single-CTA-per-output-row shape loses to cuBLAS, which is
 # nearly M-independent here. Measured on V100 for the down+up pair against the
 # compiled fallback: M=1 21.4 us vs 32.8, M=4 25.8 vs 31.7, M=12 124.4 vs 33.5.
-# bs=1 verify is M=4, which is 95% of production decode.
+# bs=1 verify is M=4, which is 95% of production decode. The native kernels
+# exist for 1, 2 and 4 rows; under CUDA-graph replay with different weights on
+# every call the pair now takes 19.8 us at M=1 and 22.2 us at M=4.
 _SM70_MAX_MIX_ROWS = 4
 
 
@@ -496,7 +499,7 @@ def fused_hc_mix(
     lowrank = w_down.shape[0]
     rows_pad = 16
     device = hyper_input_normed.device
-    num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+    num_ctas = current_arch().num_sms
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:

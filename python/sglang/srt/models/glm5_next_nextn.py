@@ -14,6 +14,9 @@
 
 import logging
 
+from torch import nn
+
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
@@ -22,6 +25,15 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
+    def prepare_cp_inputs(self, forward_batch, **kwargs):
+        # The worker has rotated the target's multimodal embeddings per request.
+        # Fill each appended token while indices still address full sequences,
+        # then let the runner shard embeddings and target states together.
+        input_embeds = self.model.embed_input_ids(
+            forward_batch.input_ids, forward_batch
+        )
+        return input_embeds, forward_batch.positions, {}
+
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
@@ -60,6 +72,17 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             return None
         return super()._resolve_nextn_quant_config(config, quant_config)
 
+    def _resolve_lm_head_quant_config(self, quant_config):
+        """The checkpoint has no draft head: the draft takes the target's lm_head
+        (set_embed_and_head), so quantize it like the target's. As
+        ``model.shared_head.head`` it misses ModelOpt's ``lm_head`` exclusion and
+        became an NVFP4 head whose never-loaded scales were repacked at load."""
+        if isinstance(
+            quant_config, ModelOptQuantConfig
+        ) and quant_config.is_layer_excluded("lm_head"):
+            return None
+        return quant_config
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(
             getattr(config, "text_config", config),
@@ -80,9 +103,15 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             for name, weight in weights
             if name.startswith(layer_prefixes)
         )
-        return Glm5NextForConditionalGeneration.load_weights(
+        loaded = Glm5NextForConditionalGeneration.load_weights(
             self, nextn_weights, is_nextn=True
         )
+        # The target's head replaces this one only after the KV pool is sized;
+        # free the never-loaded copy (151 MiB per rank at TP8) before that.
+        self.lm_head.weight = nn.Parameter(
+            self.lm_head.weight.new_empty(0), requires_grad=False
+        )
+        return loaded
 
 
 EntryClass = [Glm5NextForConditionalGenerationNextN]

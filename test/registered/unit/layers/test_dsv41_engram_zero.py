@@ -17,7 +17,12 @@ class TestEngramZeroAblation(CustomTestCase):
         x = torch.randn(3, 4, 8)
         dummy = Engram.__new__(Engram)
         with envs.SGLANG_DSV41_ENGRAM_ZERO.override(True):
-            out = Engram.forward(dummy, x, torch.zeros(3, 2, dtype=torch.int64))
+            out = Engram.forward(
+                dummy,
+                x,
+                torch.zeros(3, 2, dtype=torch.int64),
+                input_ids=torch.zeros(3, dtype=torch.int64),
+            )
         self.assertIs(out, x)
 
     def test_default_is_off(self):
@@ -32,5 +37,7 @@ class TestEngramZeroAblation(CustomTestCase):
         x = torch.randn(3, 4, 8)
         dummy = Engram.__new__(Engram)
         with envs.SGLANG_DSV41_ENGRAM_ZERO.override(True):
-            out = Engram.finish_from_gathered(dummy, x, torch.zeros(3, 2, 8))
+            out = Engram.finish_from_gathered(
+                dummy, x, torch.zeros(3, 2, 8), torch.zeros(3, dtype=torch.int64)
+            )
         self.assertIs(out, x)

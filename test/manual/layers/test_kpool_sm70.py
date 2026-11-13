@@ -17,7 +17,10 @@ from sglang.kernels.ops.attention.kpool_sm70 import (
     kpool_decode_update_and_maybe_write_cache_sm70,
     kpool_write_tail_and_maybe_compress_sm70,
 )
-from sglang.srt.layers.attention.dsa.kpool_fp8_index import kpool_max_closed_pools
+from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+    compute_pooled_write_locs,
+    kpool_max_closed_pools,
+)
 
 
 def act_quant_torch(x, round_scale):
@@ -36,11 +39,12 @@ def act_quant_torch(x, round_scale):
 
 def decode_update_torch(pool, buf, tail_k, tail_score, key, slot_score, ape, block_tables,
                         req_pool_indices, positions, seq_lens, out_cache_loc, round_scale):
-    """The torch fallback the kernel replaced, verbatim."""
+    """The torch fallback the kernel replaced, with the write location from
+    upstream's compute_pooled_write_locs (index page = entry // pool size)."""
     n = key.shape[0]
     pool_size = pool.index_kpool
     tail_size = tail_k.shape[1]
-    slots_per_page = pool.slots_per_page
+    index_page_size = pool.index_page_size
     req_raw = req_pool_indices.to(torch.long)
     pos = positions.to(torch.long)
     seq_len = seq_lens.to(torch.long)
@@ -72,19 +76,17 @@ def decode_update_torch(pool, buf, tail_k, tail_score, key, slot_score, ape, blo
     pooled = _two_pass_softmax(torch.stack(keys, 0), torch.stack(scores, 0))
     quantized, scale = _compress(pooled, round_scale)
     pool_id = torch.div(safe_pos, pool_size, rounding_mode="floor")
-    group = torch.div(pool_id, slots_per_page, rounding_mode="floor")
-    table_col = (group * pool_size).clamp(0, block_tables.shape[1] - 1)
-    page_id = block_tables[torch.arange(n, device=key.device), table_col].to(torch.long)
-    offset = torch.remainder(pool_id, slots_per_page)
-    loc = page_id * slots_per_page + offset
-    page = torch.div(loc, slots_per_page, rounding_mode="floor")
-    page_slot = loc - page * slots_per_page
-    k_bytes = slots_per_page * key.shape[-1]
+    loc = torch.cat(
+        [compute_pooled_write_locs(block_tables[i], pool_id[i : i + 1], pool_size) for i in range(n)]
+    )
+    page = torch.div(loc, index_page_size, rounding_mode="floor")
+    page_slot = loc - page * index_page_size
+    k_bytes = index_page_size * key.shape[-1]
     n_pages = buf.shape[0]
     k_view = (
         buf[:, :k_bytes]
         .view(torch.float8_e4m3fn)
-        .view(n_pages, slots_per_page, key.shape[-1])
+        .view(n_pages, index_page_size, key.shape[-1])
     )
     old_k = k_view[page, page_slot].float()
     blended = torch.where(closing.unsqueeze(-1), quantized.float(), old_k)
@@ -105,7 +107,15 @@ def decode_update_torch(pool, buf, tail_k, tail_score, key, slot_score, ape, blo
 
 class Pool:
     index_kpool = 4
-    slots_per_page = 64
+    index_page_size = 64
+
+
+def block_table_64(rows, logical_cols, g, kp=4):
+    """Block tables in 64-token pages: a row's logical page P (kp * 64 tokens)
+    is the kp entries kp * P .. kp * P + kp - 1. Logical pages differ across rows."""
+    logical = torch.randperm(rows * logical_cols, device="cuda", generator=g).reshape(rows, logical_cols)
+    sub = torch.arange(kp, device="cuda").repeat(logical_cols)
+    return (logical.repeat_interleave(kp, dim=1) * kp + sub).int()
 
 
 def same(a, b):
@@ -119,7 +129,7 @@ def decode_case(name, g, n, dtype, round_scale, key_scale=1.0, score_scale=1.0, 
     reqs = n + 3
     # Distinct pages and requests per row: the fallback's gather/scatter
     # write-back races when two rows alias a destination.
-    pages = n * 16
+    pages = n * 16  # one index page per logical page; 16 cover positions < 4096
     buf = torch.randint(0, 256, (pages, 64 * (128 + 4)), dtype=torch.uint8, device=dev, generator=g)
     tail_k = (torch.randn(reqs, tail, 128, device=dev, generator=g) * key_scale).bfloat16()
     tail_s = (torch.randn(reqs, tail, 128, device=dev, generator=g) * score_scale).bfloat16()
@@ -129,7 +139,7 @@ def decode_case(name, g, n, dtype, round_scale, key_scale=1.0, score_scale=1.0, 
         tail_k.zero_()
     score = (torch.randn(n, 128, device=dev, generator=g) * score_scale).to(dtype)
     ape = torch.randn(4, 128, device=dev, generator=g)
-    bt = torch.randperm(pages, device=dev, generator=g).reshape(n, 16).int()
+    bt = block_table_64(n, 16, g)
     # Request 0 stays free for the invalid row below, which clamps onto it.
     req = torch.randperm(reqs - 1, device=dev, generator=g)[:n] + 1
     pos = torch.randint(0, 4096, (n,), device=dev, generator=g)
@@ -186,14 +196,14 @@ def verify_case(name, g, bs, n, dtype, round_scale, gate=None, pad_row=None):
     pool = Pool()
     kp, spp, tail, cols = 4, 64, 4 + 4, 64
     reqs = bs + 2
-    pages = bs * cols
+    pages = bs * cols // kp
     buf = torch.randint(0, 256, (pages, spp * (128 + 4)), dtype=torch.uint8, device=dev, generator=g)
     tail_k = torch.randn(reqs, tail, 128, device=dev, generator=g).bfloat16()
     tail_s = torch.randn(reqs, tail, 128, device=dev, generator=g).bfloat16()
     key = torch.randn(bs * n, 128, device=dev, generator=g).to(dtype)
     score = torch.randn(bs * n, 128, device=dev, generator=g).to(dtype)
     ape = torch.randn(kp, 128, device=dev, generator=g)
-    bt = torch.randperm(pages, device=dev, generator=g).reshape(bs, cols).int()
+    bt = block_table_64(bs, cols // kp, g)
     req = torch.randperm(reqs, device=dev, generator=g)[:bs]
     ws = torch.randint(0, 3000, (bs,), device=dev, generator=g)
     ws[: min(bs, 4)] = ws[: min(bs, 4)] // 4 * 4 + torch.arange(min(bs, 4), device=dev)
@@ -201,12 +211,8 @@ def verify_case(name, g, bs, n, dtype, round_scale, gate=None, pad_row=None):
     if pad_row is not None:
         loc[pad_row * n] = 0
     closed = kpool_max_closed_pools(n, kp)
-    write_loc = torch.zeros(bs, closed, dtype=torch.int64, device=dev)
-    for b in range(bs):
-        for c in range(closed):
-            pool_id = int(ws[b]) // kp + c
-            col = min((pool_id // spp) * kp, cols - 1)
-            write_loc[b, c] = int(bt[b, col]) * spp + pool_id % spp
+    pool_ids = (ws // kp).unsqueeze(1) + torch.arange(closed, device=dev)
+    write_loc = torch.stack([compute_pooled_write_locs(bt[b], pool_ids[b], kp) for b in range(bs)])
 
     ref = [buf.clone(), tail_k.clone(), tail_s.clone()]
     for b in range(bs):

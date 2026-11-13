@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
@@ -34,6 +35,7 @@ if _is_cuda:
         _has_sgl_moe_sum_reduce = True
 
 
+# Not the JIT situ_and_mul: tanh as 2 * sigmoid(2x) - 1 is not bit-exact with it.
 @triton.jit
 def _tl_tanh(x):
     return 2.0 * tl.sigmoid(2.0 * x) - 1.0
@@ -153,18 +155,6 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
-def swiglu_gpt_oss_sigmoid_alpha_contiguous(
-    output: torch.Tensor,
-    input: torch.Tensor,  # first half is gate, second half is up
-    gemm1_alpha: float,
-    gemm1_limit: float,
-) -> None:
-    d = input.shape[1] // 2
-    gate = input[:, :d].clamp(max=gemm1_limit)
-    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
-    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
-
-
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -199,6 +189,7 @@ def fused_marlin_moe(
     is_gated: bool = True,
     gate_up_input_scale: float = 1.0,
     wide_output_scale: float = 1.0,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -223,6 +214,8 @@ def fused_marlin_moe(
     - w1_zeros (Optional[torch.Tensor]): Optional zero points to be used for w1.
     - w2_zeros (Optional[torch.Tensor]): Optional zero points to be used for w2.
     - num_bits (int): The number of bits in expert weights quantization.
+    - no_combine (bool): Return the router-weighted per-(token, expert) outputs,
+        ``[num_tokens, topk, hidden]``, instead of their top-k sum.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -291,6 +284,10 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
+    # sm70 runs marlin_v100, which reads only the padded token count and knows
+    # neither the inactive-prefix count nor zero_inactive_output.
+    is_sm70 = get_platform().is_sm70
+    inactive_prefix_count = expert_map is None and not is_sm70
     if (
         M == 1
         and topk <= 32
@@ -304,11 +301,14 @@ def fused_marlin_moe(
         from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
-            topk_ids, block_size_m
+            topk_ids, block_size_m, return_inactive_prefix_count=not is_sm70
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            return_inactive_prefix_count=inactive_prefix_count,
         )
 
     if workspace is None:
@@ -334,15 +334,16 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    # Marlin skips masked expert rows, so their shared cache must start at zero.
-    intermediate_cache13 = torch.zeros(
-        (M * topk_ids.shape[1] * max(gemm1_n, K),),
+    # Marlin skips masked expert rows; on sm70 their shared cache must start at
+    # zero (no zero_inactive_output there).
+    intermediate_cache13 = (torch.zeros if is_sm70 else torch.empty)(
+        (M * topk * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * gemm1_n]
     intermediate_cache1 = intermediate_cache1.view(-1, gemm1_n)
-    intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
+    intermediate_cache3 = intermediate_cache13[: M * topk * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
     use_atomic_add = (
@@ -382,6 +383,8 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=is_ep,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=inactive_prefix_count,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -414,11 +417,12 @@ def fused_marlin_moe(
     elif activation == "silu" and is_gated and gemm1_alpha is not None:
         if clamp_limit is None:
             raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
-        swiglu_gpt_oss_sigmoid_alpha_contiguous(
-            intermediate_cache2,
+        swiglu_oai_split(
             intermediate_cache1.view(-1, gemm1_n),
             gemm1_alpha,
+            1.0,
             clamp_limit,
+            out=intermediate_cache2,
         )
     elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
@@ -442,7 +446,9 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if is_ep:
+    # Gate-up is dead; the down GEMM defines inactive rows in the shared output.
+    # marlin_v100 has no zero_inactive_output, so on sm70 EP zeroes them here.
+    if is_sm70 and is_ep:
         intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
@@ -463,7 +469,10 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
+        zero_inactive_output=True,
         is_ep=is_ep,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=inactive_prefix_count,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
@@ -482,6 +491,9 @@ def fused_marlin_moe(
             activation_scales,
             residual_scale=wide_output_scale,
         )
+
+    if no_combine:
+        return intermediate_cache3
 
     output = zero_copy_context.get_moe_output(hidden_states)
     if output is None:

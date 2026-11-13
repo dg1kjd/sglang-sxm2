@@ -15,6 +15,8 @@
 #   GLM53_MTP_STEPS=3          (0 turns MTP off)
 #   GLM53_CONTEXT_LENGTH / GLM53_MEM_FRACTION   (defaults follow GLM53_MTP_STEPS)
 #   GLM53_MAMBA_SLOTS=12  GLM53_EP_SIZE=1
+#   GLM53_VISION=1             (0 serves text only)
+#   GLM53_VIDEO_MAX_TOKENS=32768   (all videos of one request together)
 #   GLM53_EXTRA_ARGS="..."     (appended to the launch_server arguments)
 set -euo pipefail
 
@@ -77,6 +79,33 @@ if [[ "$GLM53_MTP_STEPS" -gt 0 ]]; then
     --speculative-num-draft-tokens "$((GLM53_MTP_STEPS + 1))")
 fi
 
+# Vision: the tower's weights stay in pinned host memory and run per image or
+# group of video frames (glm5_next.py); what stays on the GPU is ~20 MB per rank.
+# The checkpoint's processor ships with transformers 5.19.
+GLM53_VISION="${GLM53_VISION:-1}"
+VISION_ARGS=()
+# The embedding cache keeps an image that spans several prefill chunks from
+# being encoded again for each chunk. In host memory it costs no KV pool
+# (100 MB on the GPU would be ~7.4k tokens). Also set for text only: there
+# --language-only still counts the model as multimodal, so the GPU cache's
+# 100 MB default would be reserved for images it never takes.
+export SGLANG_USE_HOST_VLM_CACHE="${SGLANG_USE_HOST_VLM_CACHE:-1}"
+if [[ "$GLM53_VISION" == 0 ]]; then
+  VISION_ARGS=(--language-only)
+else
+  "$VENV/bin/python" -c "import transformers.models.glm5_next.processing_glm5_next" 2>/dev/null || {
+    echo "GLM-5.3 vision needs transformers>=5.19 in $VENV (requirements.txt);" \
+      "GLM53_VISION=0 serves text only" >&2; exit 1; }
+  # Image preprocessing on the GPU would put a CUDA context on the first card.
+  export SGLANG_FORCE_CPU_IMAGE_PREPROCESSING="${SGLANG_FORCE_CPU_IMAGE_PREPROCESSING:-1}"
+  # 512 MB per rank holds eight full-size images or two capped videos.
+  export SGLANG_VLM_CACHE_SIZE_MB="${SGLANG_VLM_CACHE_SIZE_MB:-512}"
+  # The checkpoint lets one video fill the whole context (240000 tokens). Every
+  # rank holds a video's embedding on the GPU while it is prefilled, so cap it.
+  VISION_ARGS=(--mm-process-config
+    "{\"video\": {\"max_image_tokens\": ${GLM53_VIDEO_MAX_TOKENS:-32768}}}")
+fi
+
 # --sleep-on-idle: without it the eight idle scheduler loops keep ~5.3 cores
 # busy (measured 2026-10-05).
 exec "$VENV/bin/python" -m sglang.launch_server \
@@ -88,7 +117,6 @@ exec "$VENV/bin/python" -m sglang.launch_server \
   --dtype float16 \
   --quantization modelopt_fp4 \
   --fp4-gemm-backend marlin \
-  --language-only \
   --tensor-parallel-size 8 \
   --ep-size "${GLM53_EP_SIZE:-1}" \
   --attention-backend dsa \
@@ -110,4 +138,4 @@ exec "$VENV/bin/python" -m sglang.launch_server \
   --mem-fraction-static "${GLM53_MEM_FRACTION:-$MEM_FRACTION_DEFAULT}" \
   --host "${SGLANG_V100_HOST:-0.0.0.0}" \
   --port "${SGLANG_V100_PORT:-11435}" \
-  "${SPEC_ARGS[@]}" ${GLM53_EXTRA_ARGS:-}
+  "${VISION_ARGS[@]}" "${SPEC_ARGS[@]}" ${GLM53_EXTRA_ARGS:-}

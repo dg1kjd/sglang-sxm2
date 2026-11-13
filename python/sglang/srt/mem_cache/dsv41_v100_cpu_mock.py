@@ -249,7 +249,6 @@ def check_index_if_present(lines: List[str]) -> Optional[int]:
 def check_sm70_fail_closed(lines: List[str]) -> Optional[int]:
     import torch
 
-    from sglang.srt.layers.attention import dsa_backend
     from sglang.srt.layers.attention.dsv4.v41_indexer import (
         is_sm100_or_newer,
         make_candidate_indexer,
@@ -294,11 +293,7 @@ def check_sm70_fail_closed(lines: List[str]) -> Optional[int]:
                 "indexer on SM70",
             )
             return EXIT_SM90
-    _log(
-        lines,
-        f"SM90_GATE_OK candidate indexer closed below SM100; "
-        f"dsa_backend.deep_gemm={dsa_backend.deep_gemm is not None}",
-    )
+    _log(lines, "SM90_GATE_OK candidate indexer closed below SM100")
     return None
 
 

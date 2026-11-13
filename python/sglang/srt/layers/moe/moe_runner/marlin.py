@@ -336,6 +336,11 @@ def fused_experts_none_to_marlin(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"
         )
 
+    # Marlin always applies the router weight inside its down GEMM.
+    assert (
+        not runner_config.no_combine or runner_config.no_combine_keep_router_weight
+    ), "Marlin MoE supports no_combine only with no_combine_keep_router_weight"
+
     # Use a per-call workspace so captured graphs cannot alias Marlin's
     # inter-block reduction locks and deadlock during capture.
     workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
@@ -399,6 +404,7 @@ def fused_experts_none_to_marlin(
         is_gated=runner_config.is_gated,
         gate_up_input_scale=runner_config.gate_up_input_scale,
         wide_output_scale=runner_config.wide_output_scale,
+        no_combine=runner_config.no_combine,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

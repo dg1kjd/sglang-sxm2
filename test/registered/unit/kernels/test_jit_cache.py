@@ -7,6 +7,7 @@ directory, a moved clone still hits — are checked without a GPU or a compiler.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import pathlib
 import sys
@@ -14,12 +15,24 @@ import sys
 import msgspec
 import pytest
 
-from sglang.kernels.jit.utils.compile import cache, ninja
+from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
+from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def _stub_tvm_ffi_paths(monkeypatch):
+    # XPU images do not ship tvm_ffi; only the paths' text reaches the ninja file.
+    if is_xpu() and importlib.util.find_spec("tvm_ffi") is None:
+        monkeypatch.setattr(
+            toolchain,
+            "tvm_ffi_paths",
+            lambda: (("/opt/tvm_ffi/include",), "/opt/tvm_ffi/lib", "tvm_ffi"),
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -139,8 +152,18 @@ def test_anchor_roots_are_symlink_resolved(tmp_path, monkeypatch):
         {"cpp_wrappers": (("run", "Other::run"),)},
         {"include_paths": ("/opt/extra",)},
         {"header_only": False, "cpp_files": ("/tmp/x.cpp",), "cpp_wrappers": ()},
+        {"cuda_files": ("/tmp/x.cuh",), "cuda_units": (("UNIT=1",),)},
     ],
-    ids=["args", "cuda_cflags", "cflags", "ldflags", "wrappers", "includes", "mode"],
+    ids=[
+        "args",
+        "cuda_cflags",
+        "cflags",
+        "ldflags",
+        "wrappers",
+        "includes",
+        "mode",
+        "units",
+    ],
 )
 def test_build_key_separates_every_build_input(overrides):
     """Two builds differing in any of these must never share a directory.
@@ -473,6 +496,27 @@ def test_header_only_module_compiles_through_a_generated_wrapper(tmp_path):
     assert "#include <tvm/ffi/function.h>" in generated
 
 
+def test_cuda_units_compile_the_sources_again_with_their_macros(tmp_path):
+    source = str(tmp_path / "kernel.cuh")
+    spec = _spec(
+        cuda_files=(source,),
+        cpp_wrappers=(),
+        cuda_wrappers=(("run", "K::run"),),
+        cuda_units=(("UNIT=A(1) A(2)",), ("UNIT=A(3)", "FLAG")),
+    )
+    units = spec.translation_units()
+    assert [unit.filename for unit in units] == [
+        "cuda.cu",
+        "cuda_unit0.cu",
+        "cuda_unit1.cu",
+    ]
+    # Units only instantiate: the generated wrapper alone exports.
+    assert units[1].source == f'#define UNIT A(1) A(2)\n#include "{source}"\n'
+    assert units[2].source == f'#define UNIT A(3)\n#define FLAG\n#include "{source}"\n'
+    link = next(line for line in ninja.generate(spec).splitlines() if ": link " in line)
+    assert link.endswith("cuda_0.o cuda_unit0_1.o cuda_unit1_2.o")
+
+
 def test_non_header_only_module_compiles_its_sources_in_place(tmp_path):
     source = str(tmp_path / "kernel.cu")
     units = _spec(
@@ -526,6 +570,27 @@ def test_relative_sources_resolve_against_csrc():
         str(KERNEL_PATH / "csrc" / "elementwise" / "activation.cuh"),
     )
     assert resolve_sources(["/usr/include/stdio.h"]) == ("/usr/include/stdio.h",)
+
+
+def test_sm70_load_inline_dirs_separate_sources_and_compilers(tmp_path, monkeypatch):
+    """The V100 load_inline extensions get one build directory per source, flags
+    and compiler environment, so two checkouts never import each other's library
+    and an engine and a test run with different host compilers do not rebuild
+    each other's build."""
+    from sglang.kernels.sm70_paths import _JIT_BUILD_ENV, sm70_jit_build_dir
+
+    for name in _JIT_BUILD_ENV:
+        monkeypatch.delenv(name, raising=False)
+    base = str(tmp_path / "ext")
+    first = sm70_jit_build_dir(base, "kernel v1", ["-O3"])
+    assert os.path.isdir(first) and os.path.dirname(first) == base
+    assert sm70_jit_build_dir(base, "kernel v1", ["-O3"]) == first
+    assert sm70_jit_build_dir(base, "kernel v2", ["-O3"]) != first
+    assert sm70_jit_build_dir(base, "kernel v1", ["-O2"]) != first
+    monkeypatch.setenv("NVCC_PREPEND_FLAGS", "-ccbin /usr/bin/g++-14")
+    assert sm70_jit_build_dir(base, "kernel v1", ["-O3"]) != first
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert sm70_jit_build_dir("~/ext", "kernel v1", ["-O3"]).startswith(base)
 
 
 if __name__ == "__main__":

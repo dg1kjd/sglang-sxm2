@@ -22,6 +22,10 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 # owned by any model layer.
 PLE_NGRAM_STATE_LAYER_ID = (1 << 32) - 1
 
+# The parts a KV pool's layer router names these states by.
+SHORT_CONV_PART = "short_conv"
+NGRAM_PART = "ngram"
+
 
 class SlotIndexedState(Protocol):
     """Per-request state owned by a MambaPool slot but not layer-major.

@@ -58,7 +58,7 @@ Rows dated 2026-10-05 are streamed chat requests on `scripts/serve_dsv41_v100.sh
 | Cold prefill scout, server counted 5,286 prompt tokens | TTFT **45.3 s**, **117** tok/s |
 | Warmer one-token prefill, 8,004 tokens, spill already touched | TTFT **14.3 s**, **558** tok/s |
 
-Acceptance depends on the text: code and tool calls accept 4 to 6 tokens per step, free prose (reviews, explanations, reasoning) 2.5 to 3.5, so prose decodes at roughly two thirds of the coding rate. The 2.8 tok/s cell is greedy padding, the case this model loops on. It is a different number from the 11.1 tok/s coding rate and from the ~300 tok/s uncached suffix above. The 117 tok/s scout is the cold first touch; 558 tok/s is the same box after that spill was already warm. Temperature 0 is right for short code and wrong for long prose. Use `temperature=1`, `top_p=0.95` for chat. The ship script leaves `/health` as a liveness probe (no generation), so a load balancer GET does not drop the sticky pin.
+Acceptance depends on the text: code and tool calls accept 4 to 6 tokens per step, free prose (reviews, explanations, reasoning) 2.5 to 3.5, so prose decodes at roughly two thirds of the coding rate. The 2.8 tok/s cell is greedy padding, the case this model loops on. It is a different number from the 11.1 tok/s coding rate and from the ~300 tok/s uncached suffix above. The 117 tok/s scout is the cold first touch; 558 tok/s is the same box after that spill was already warm. Temperature 0 is right for short code and wrong for long prose. Use `temperature=1`, `top_p=0.95` for chat. The ship script leaves `/health` as a liveness probe (no generation), so a load balancer GET does not drop the sticky pin. `/health_generate` on an idle server does generate: the pin is kept, its CSA2 image goes to the session store, and the next turn loads it back and resumes. With the session store off, a `/health_generate` drops the pin.
 
 ## Reference recipe
 
@@ -72,11 +72,9 @@ export SGLANG_DSV41_CONTEXT_LEN=262144
 bash scripts/serve_dsv41_v100.sh
 ```
 
-Expanded (what the script actually runs when DSpark is on). Spill, Engram, and sticky are set by the env block, not implied by the CLI flags.
+Expanded (what the script actually runs when DSpark is on). Spill and sticky are set by the env block, not implied by the CLI flags; Engram placement is `--engram-config`.
 
 ```bash
-export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
-export SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=private
 export SGLANG_DSV41_EXPERT_SPILL_APPLY=1
 export SGLANG_DSV41_EXPERT_SPILL_GB=13
 export SGLANG_DSV41_SPILL_LANDING=36
@@ -97,6 +95,7 @@ python -m sglang.launch_server \
   --context-length 262144 \
   --chunked-prefill-size 2048 \
   --mem-fraction-static 0.87 \
+  --engram-config '{"placement": "cpu", "replication": "none"}' \
   --max-running-requests 1 \
   --max-total-tokens 262144 \
   --max-prefill-tokens 262144 \

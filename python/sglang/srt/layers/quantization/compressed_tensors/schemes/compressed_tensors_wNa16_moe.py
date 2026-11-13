@@ -27,7 +27,8 @@ from sglang.srt.layers.quantization.marlin_utils import (
     sm70_marlin_moe_logical_scales,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 
 if TYPE_CHECKING:
     from compressed_tensors.quantization import QuantizationArgs
@@ -223,6 +224,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
             layer.register_parameter("w2_weight_zero_point", w2_qzeros)
             set_weight_attrs(w2_qzeros, extra_weight_attrs)
+            set_weight_attrs(w2_qzeros, {"load_full_w2": load_full_w2})
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(

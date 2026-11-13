@@ -10,7 +10,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
@@ -89,8 +89,6 @@ def _make_indexer(rotary, device, dtype=torch.bfloat16):
 class FakePool:
     """Minimal stand-in for the QSA KV pool buffers used by the indexer."""
 
-    index_state_dtype = torch.bfloat16
-
     def __init__(
         self,
         num_slots,
@@ -100,6 +98,7 @@ class FakePool:
         compressed_dtype=None,
     ):
         # Ring in the compute dtype, compressed cache and index Q in the storage dtype.
+        self.index_state_dtype = dtype
         self.qsa_compressed_dtype = compressed_dtype or dtype
         self.key_state = torch.zeros(num_slots, 1, HEAD_DIM, dtype=dtype, device=device)
         self.qsa_rope_position_buffer = torch.zeros(
@@ -235,6 +234,144 @@ def test_fused_q_prep_fp8_matches_eager_cast():
     assert_fp8_within_one_ulp(q_new, q_ref.to(torch.float8_e4m3fn))
 
 
+_ON_SM70 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (7, 0)
+
+
+def _make_fp16_indexer_with_attention_rope(device):
+    """Qwen3.8 on V100: the indexer shares the attention RoPE (head 256, partial
+    0.25), whose first fp16 call turns the cache into fp16. Returns the fp32 cache too."""
+    rotary = MRotaryEmbedding(
+        head_size=256,
+        rotary_dim=64,
+        max_position_embeddings=262144,
+        base=10000000,
+        is_neox_style=True,
+        dtype=torch.float16,
+        mrope_section=[11, 11, 10],
+        mrope_interleaved=True,
+    )
+    indexer = _make_indexer(rotary, device, torch.float16)
+    fp32_cache = rotary.cos_sin_cache.clone()
+    assert fp32_cache.dtype == torch.float32
+    query = torch.randn(4, 6 * 256, device=device, dtype=torch.float16)
+    key = torch.randn(4, 256, device=device, dtype=torch.float16)
+    rotary(torch.zeros(3, 4, dtype=torch.long, device=device), query, key)
+    assert rotary.cos_sin_cache.dtype == torch.float16
+    return indexer, fp32_cache
+
+
+def _fp16_test_positions(tokens, multimodal, start, device):
+    text = torch.arange(start, start + tokens, device=device)
+    if not multimodal:
+        return text
+    # Image-like spans: the three MRoPE axes get different coordinates.
+    positions = text.unsqueeze(0).repeat(3, 1)
+    positions[1:] += torch.randint(0, 64, (2, tokens), device=device)
+    return positions
+
+
+@pytest.mark.skipif(not _ON_SM70, reason="fp16 RoPE caches are accepted on SM70 only")
+def test_fused_prep_accepts_fp16_cache_from_attention_rope():
+    device = torch.device("cuda")
+    indexer, _ = _make_fp16_indexer_with_attention_rope(device)
+    probe = torch.empty(1, device=device, dtype=torch.float16)
+    assert indexer._use_fused_prep(probe)
+    assert not indexer._use_fused_prep(probe.bfloat16())
+
+
+@pytest.mark.skipif(not _ON_SM70, reason="fp16 RoPE caches are accepted on SM70 only")
+@pytest.mark.parametrize("tokens", [1, 4, 16, 2048])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_fused_q_prep_fp16_cache_matches_eager(tokens, multimodal):
+    device = torch.device("cuda")
+    dtype = torch.float16
+    torch.manual_seed(tokens)
+    indexer, _ = _make_fp16_indexer_with_attention_rope(device)
+    hidden = torch.randn(tokens, HIDDEN, device=device, dtype=dtype)
+    # Close to the 262,144-row end of the cache.
+    positions = _fp16_test_positions(tokens, multimodal, 257000 - tokens, device)
+    qk, _ = indexer.index_qk_proj(hidden)
+    q_ref = indexer.q_layernorm(qk[:, : NUM_Q_HEADS * HEAD_DIM].reshape(-1, HEAD_DIM))
+    q_ref = indexer.apply_rope(positions, q_ref.reshape(tokens, NUM_Q_HEADS, HEAD_DIM))
+
+    pool = FakePool(4096, 16, device, dtype)
+    cache_loc = torch.randperm(4096, device=device)[:tokens]
+    q_new, token_k, stored = indexer.project_qk(
+        hidden, positions, pool=pool, cache_loc=cache_loc
+    )
+    assert stored
+    assert torch.equal(q_new.view(torch.int16), q_ref.view(torch.int16))
+    assert torch.equal(pool.key_state[cache_loc], token_k)
+    rope_axes = positions if positions.ndim == 2 else positions.expand(3, -1)
+    assert torch.equal(pool.qsa_rope_position_buffer[cache_loc], rope_axes.T)
+
+
+@pytest.mark.skipif(not _ON_SM70, reason="fp16 RoPE caches are accepted on SM70 only")
+@pytest.mark.parametrize("num_groups", [1, 3, 512])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_fused_compress_fp16_cache_matches_eager(num_groups, multimodal):
+    device = torch.device("cuda")
+    dtype = torch.float16
+    torch.manual_seed(num_groups)
+    indexer, _ = _make_fp16_indexer_with_attention_rope(device)
+    pool_ref = FakePool(8192, 4096, device, dtype)
+    pool_new = FakePool(8192, 4096, device, dtype)
+    keys = torch.randn(8192, 1, HEAD_DIM, device=device, dtype=dtype)
+    pool_ref.key_state.copy_(keys)
+    pool_new.key_state.copy_(keys)
+    member_slots = torch.randperm(8192, device=device)[: num_groups * RATIO]
+    member_positions = _fp16_test_positions(
+        num_groups * RATIO, multimodal, 200000, device
+    )
+    for pool in (pool_ref, pool_new):
+        pool.set_qsa_rope_position_buffer(member_slots, member_positions)
+    group_locs = member_slots.view(num_groups, RATIO).to(torch.int32)
+    write_locs = torch.randperm(4096, device=device)[:num_groups].to(torch.int32)
+
+    assert indexer._use_fused_compress(pool_new)
+    _eager_compress_reference(indexer, pool_ref, group_locs, write_locs)
+    indexer._fused_compress_store(pool_new, group_locs, write_locs)
+    assert torch.equal(
+        pool_new.compressed.view(torch.int16), pool_ref.compressed.view(torch.int16)
+    )
+
+
+def test_fused_q_prep_fp16_and_fp32_caches_agree():
+    """An fp16 cache must give the rows of the fp32 cache it was rounded from."""
+    from sglang.kernels.ops.attention.qsa_indexer import qsa_index_q_norm_rope_store
+
+    device = torch.device("cuda")
+    torch.manual_seed(5)
+    indexer, fp32_cache = _make_fp16_indexer_with_attention_rope(device)
+    fp16_cache = indexer.rotary_emb.cos_sin_cache
+    assert not torch.equal(fp32_cache, fp16_cache.float())
+    tokens = 64
+    qk = torch.randn(
+        tokens, (NUM_Q_HEADS + 1) * HEAD_DIM, device=device, dtype=torch.float16
+    )
+    # A [3, T] slice of a wider buffer, as CUDA-graph replays pass it.
+    graph_positions = torch.zeros(3, tokens + 7, dtype=torch.long, device=device)
+    graph_positions[:, :tokens] = _fp16_test_positions(tokens, True, 1000, device)
+    outputs = [
+        qsa_index_q_norm_rope_store(
+            qk,
+            graph_positions[:, :tokens],
+            cache,
+            indexer._rope_axis_map(device),
+            indexer.q_layernorm.weight.data,
+            torch.arange(tokens, device=device),
+            torch.zeros(tokens, HEAD_DIM, device=device, dtype=torch.float16),
+            torch.zeros(tokens, 3, dtype=torch.long, device=device),
+            NUM_Q_HEADS,
+            indexer.rotary_emb.rotary_dim,
+            indexer.q_layernorm.variance_epsilon,
+            True,
+        )
+        for cache in (fp16_cache, fp32_cache)
+    ]
+    assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
+
+
 def _selected_score_multisets(logits, block_indices):
     """Sorted logits of the selected blocks per row, so tied blocks compare equal."""
     out = []
@@ -301,6 +438,282 @@ def test_tilelang_mqa_matches_torch_reference(dtype):
     torch.testing.assert_close(out_p[finite], ref_p[finite], rtol=2e-3, atol=2e-3)
 
 
+def _packed_prefill_case(
+    lengths, rows_per_block, device, dtype, seed, empty_rows=False
+):
+    """Packed compressed keys for requests of ``lengths`` blocks, and query rows in
+    a CP-like order: each request contributes two row blocks (prev, next), laid
+    out as [all prev blocks, all next blocks], so rows of different requests
+    share 32-row kernel blocks whenever ``rows_per_block`` is not a multiple of
+    32. Each row's range is [request start, start + causal count]; with
+    ``empty_rows`` each request's first row sees no block, as the first
+    ratio - 1 tokens of a fresh request do."""
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    offsets = [0]
+    for n in lengths:
+        offsets.append(offsets[-1] + n)
+    k = torch.randn(offsets[-1], 1, HEAD_DIM, generator=gen).to(device).to(dtype)
+    starts, ends = [], []
+    for half in range(2):
+        for req, n in enumerate(lengths):
+            for i in range(rows_per_block):
+                frac = (half * rows_per_block + i + 1) / (2 * rows_per_block)
+                starts.append(offsets[req])
+                empty = empty_rows and half == 0 and i == 0
+                ends.append(offsets[req] + (0 if empty else max(1, int(n * frac))))
+    rows = len(starts)
+    q = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, generator=gen).to(device).to(dtype)
+    as_tensor = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
+    return q, k, as_tensor(starts), as_tensor(ends), max(lengths)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "lengths, rows_per_block",
+    [
+        ([700, 3000, 1500], 37),  # row blocks straddle requests
+        ([4096] * 6, 64),  # aligned blocks, equal lengths
+        ([9000], 8),  # one short request: many key splits
+    ],
+)
+def test_relative_prefill_scores_equal_absolute(dtype, lengths, rows_per_block):
+    """Request-relative scoring puts the same fp32 values in each row's own
+    window as the absolute-layout kernel does, bit for bit."""
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_prefill,
+        tilelang_qsa_mqa_prefill_relative,
+        torch_qsa_mqa_prefill_relative,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    q, k, starts, ends, width = _packed_prefill_case(
+        lengths, rows_per_block, torch.device("cuda"), dtype, seed=11
+    )
+    absolute = tilelang_qsa_mqa_prefill(q, k, starts, ends)
+    relative = tilelang_qsa_mqa_prefill_relative(q, k, starts, ends, width)
+    assert relative.shape == (q.shape[0], width)
+    for row in range(q.shape[0]):
+        s, e = int(starts[row]), int(ends[row])
+        assert torch.equal(relative[row, : e - s], absolute[row, s:e]), row
+    # The torch reference agrees on the windows (and masks the rest).
+    reference = torch_qsa_mqa_prefill_relative(q, k, starts, ends, width)
+    lengths_t = (ends - starts).long().reshape(-1, 1)
+    window = torch.arange(width, device=q.device) < lengths_t
+    torch.testing.assert_close(
+        relative[window], reference[window], rtol=2e-3, atol=2e-3
+    )
+    assert torch.isneginf(reference[~window]).all()
+
+
+@pytest.mark.parametrize(
+    "lengths, rows_per_block", [([700, 3000, 1500], 37), ([2600] * 8, 32)]
+)
+def test_select_prefill_tokens_relative_matches_absolute(
+    lengths, rows_per_block, monkeypatch
+):
+    """select_prefill_tokens picks blocks of the same scores with request-relative
+    logits (max_row_keys given) as with logits over the whole packed batch.
+    Compared as per-row score multisets: the fast top-k breaks the ReLU-sum's
+    exact-zero ties differently run to run, even between two absolute runs."""
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_prefill,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+
+    q, k, starts, ends, width = _packed_prefill_case(
+        lengths, rows_per_block, device, torch.bfloat16, seed=5, empty_rows=True
+    )
+    indexer = SimpleNamespace(token_topk=2048, compress_ratio=RATIO, block_topk=512)
+    # Shrink the logits budget so the relative path runs as several row chunks,
+    # with chunk boundaries inside requests, as large batches do.
+    monkeypatch.setattr(
+        qsa_indexer_module, "_QSA_PREFILL_LOGITS_BUDGET_BYTES", 64 * width * 4
+    )
+    assert (
+        qsa_indexer_module._qsa_prefill_row_chunk_size(q.shape[0], width, NUM_Q_HEADS)
+        < q.shape[0]
+    )
+    relative_calls = []
+    relative_scoring = qsa_indexer_module.qsa_mqa_prefill_relative
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "qsa_mqa_prefill_relative",
+        lambda *args: relative_calls.append(1) or relative_scoring(*args),
+    )
+    # Rows sit at the last token of their causal range; sequence lengths follow.
+    # An empty row is a token before the request's first complete block.
+    lengths_t = (ends - starts).long()
+    seq_lens = torch.where(lengths_t > 0, lengths_t * RATIO, 2).to(torch.int32)
+    positions = (seq_lens - 1).long()
+    absolute = QSAIndexer.select_prefill_tokens(
+        indexer, q, k, starts, ends, positions, seq_lens
+    )
+    relative = QSAIndexer.select_prefill_tokens(
+        indexer, q, k, starts, ends, positions, seq_lens, max_row_keys=width
+    )
+    assert len(relative_calls) >= 2, "the relative path did not run in chunks"
+    scores = tilelang_qsa_mqa_prefill(q, k, starts, ends)
+    longer_than_topk = 0
+    for row in range(q.shape[0]):
+        start, length = int(starts[row]), int(ends[row] - starts[row])
+        picked = []
+        for out in (absolute, relative):
+            tokens = out[row][out[row] >= 0].long()
+            blocks = torch.unique(tokens // RATIO)
+            blocks = blocks[blocks < length]
+            picked.append(scores[row, start + blocks].sort().values)
+        assert torch.equal(picked[0], picked[1]), row
+        longer_than_topk += length > indexer.block_topk
+    assert longer_than_topk > 0, "no row exercises the top-k cut"
+
+
+class _FakeSplitGroup:
+    """Rank ``rank_in_group`` of a ``world_size``-rank group. all_gather records
+    this rank's share in ``shares`` and returns every rank's share, -1 for peers
+    that have not run yet."""
+
+    def __init__(self, world_size, rank_in_group, shares):
+        self.world_size = world_size
+        self.rank_in_group = rank_in_group
+        self.shares = shares
+
+    def all_gather(self, local, dim):
+        assert dim == 0
+        self.shares[self.rank_in_group] = local.clone()
+        return torch.cat(
+            [torch.full_like(local, -1) if x is None else x for x in self.shares]
+        )
+
+
+@pytest.mark.parametrize(
+    "lengths, rows_per_block, world_size",
+    [
+        ([700, 3000, 1500], 37, 2),
+        ([700, 3000, 1500], 37, 3),  # uneven shares, chunk ends inside shares
+        ([2600] * 8, 32, 4),
+        ([9000], 1, 3),  # two rows: the last rank scores none
+    ],
+)
+def test_select_prefill_tokens_split_matches_one_rank(
+    lengths, rows_per_block, world_size, monkeypatch
+):
+    """With a split group each rank scores only its contiguous share of the rows,
+    and the gathered selection picks blocks of the same scores as one rank
+    scoring every row (score multisets: see the test above for the fast top-k's
+    tie breaking)."""
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_prefill,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+
+    q, k, starts, ends, width = _packed_prefill_case(
+        lengths, rows_per_block, torch.device("cuda"), torch.bfloat16, 7, True
+    )
+    rows = q.shape[0]
+    indexer = SimpleNamespace(token_topk=2048, compress_ratio=RATIO, block_topk=512)
+    monkeypatch.setattr(
+        qsa_indexer_module, "_QSA_PREFILL_LOGITS_BUDGET_BYTES", 64 * width * 4
+    )
+    scored_rows = []
+    relative_scoring = qsa_indexer_module.qsa_mqa_prefill_relative
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "qsa_mqa_prefill_relative",
+        lambda *args: scored_rows.append(args[0].shape[0]) or relative_scoring(*args),
+    )
+    lengths_t = (ends - starts).long()
+    seq_lens = torch.where(lengths_t > 0, lengths_t * RATIO, 2).to(torch.int32)
+    positions = (seq_lens - 1).long()
+    args = (indexer, q, k, starts, ends, positions, seq_lens)
+    one_rank = QSAIndexer.select_prefill_tokens(*args, max_row_keys=width)
+
+    shares = [None] * world_size
+    per_rank = -(-rows // world_size)
+    outputs = []
+    for _ in range(2):  # the second pass sees every peer's share
+        outputs.clear()
+        for rank in range(world_size):
+            scored_rows.clear()
+            outputs.append(
+                QSAIndexer.select_prefill_tokens(
+                    *args,
+                    max_row_keys=width,
+                    split_group=_FakeSplitGroup(world_size, rank, shares),
+                )
+            )
+            share = max(0, min(rows, (rank + 1) * per_rank) - rank * per_rank)
+            assert sum(scored_rows) == share, rank
+    scores = tilelang_qsa_mqa_prefill(q, k, starts, ends)
+    for out in outputs:
+        for row in range(rows):
+            start, length = int(starts[row]), int(ends[row] - starts[row])
+            picked = []
+            for selection in (one_rank, out):
+                tokens = selection[row][selection[row] >= 0].long()
+                blocks = torch.unique(tokens // RATIO)
+                picked.append(
+                    scores[row, start + blocks[blocks < length]].sort().values
+                )
+            assert torch.equal(picked[0], picked[1]), row
+
+
+def test_prefill_split_group_gate(monkeypatch):
+    """Rows are split from 8192 compressed blocks and 1024 rows on, outside graph
+    capture, over an attention-TP group of more than one rank."""
+    from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+
+    split_group = qsa_indexer_module._qsa_prefill_split_group
+    group = SimpleNamespace(world_size=4)
+    capturing = [False]
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "get_parallel",
+        lambda: SimpleNamespace(attn_tp_group=group),
+    )
+    monkeypatch.setattr(qsa_indexer_module, "get_is_capture_mode", lambda: capturing[0])
+    assert split_group(1024, 8192) is group
+    assert split_group(1023, 50000) is None
+    assert split_group(4096, 8191) is None
+    assert split_group(4096, None) is None
+    capturing[0] = True
+    assert split_group(4096, 50000) is None
+    capturing[0] = False
+    group.world_size = 1
+    assert split_group(4096, 50000) is None
+
+
+def test_prefill_max_row_keys_reads_host_lengths_only():
+    """The relative logits width comes from host lengths: the prefill tuple when
+    set, else the scheduler's seq_lens_cpu; with neither it is None (the
+    absolute path), never a device read."""
+    from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
+
+    def width(tuple_lengths, host_lengths):
+        meta = SimpleNamespace(
+            prefill_sequence_lengths_cpu=tuple_lengths, compress_ratio=RATIO
+        )
+        return QSAIndexerMetadata.prefill_max_row_keys(meta, host_lengths)
+
+    host = torch.tensor([130, 7, 4099], dtype=torch.int64)
+    assert width((130, 7, 4099), None) == 4099 // RATIO
+    assert width(None, host) == 4099 // RATIO
+    # The tuple wins over the scheduler lengths when both exist.
+    assert width((16, 20), host) == 20 // RATIO
+    assert width(None, None) is None
+    assert width(None, torch.empty(0, dtype=torch.int64)) is None
+
+
 def test_tilelang_mqa_rejects_mixed_operand_dtypes():
     """Mixed fp8/bf16 operands must fail instead of dequantizing the cache."""
     from sglang.srt.layers.attention.qsa.mqa import (
@@ -317,6 +730,91 @@ def test_tilelang_mqa_rejects_mixed_operand_dtypes():
     context_lens = torch.full((2,), 32, dtype=torch.int32, device=device)
     with pytest.raises(ValueError, match="same dtype"):
         tilelang_qsa_mqa_decode(q, cache, page_table, context_lens, 64)
+
+
+def _decode_operands(rows, max_pages, page_size, context_lens, device):
+    q = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, device=device).to(torch.bfloat16)
+    cache = torch.randn(1024, page_size, 1, HEAD_DIM, device=device).to(torch.bfloat16)
+    page_table = torch.randint(
+        0, 1024, (rows, max_pages), device=device, dtype=torch.int32
+    )
+    return q, cache, page_table, context_lens.to(device=device, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("rows", [6, 100, 700])
+def test_tilelang_mqa_decode_grid_covers_every_group(rows):
+    """The decode kernel strides 256, 16 or 1 CTAs per row (by row count) over the
+    row's 64-token groups. Every group of every row must be scored, and nothing
+    is written past a row's context length."""
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+        torch_qsa_mqa_decode,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    torch.manual_seed(rows)
+    max_pages, page_size = 128, 16
+    max_model_len = max_pages * page_size
+    lens = torch.randint(1, max_model_len + 1, (rows,))
+    lens[0] = max_model_len
+    q, cache, page_table, lens = _decode_operands(
+        rows, max_pages, page_size, lens, device
+    )
+    ref = torch_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    out = tilelang_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    finite = torch.isfinite(ref)
+    assert torch.equal(finite, torch.isfinite(out))
+    torch.testing.assert_close(out[finite], ref[finite], rtol=2e-3, atol=2e-3)
+
+
+def test_tilelang_mqa_decode_skips_rows_that_fit_topk():
+    """With min_scored_len = k the kernel leaves rows that fit k unscored and
+    nothing past a row's length is set; ordered_topk(k), the decode path's
+    top-k, must still select exactly what it selects on fully scored logits
+    (every block of a row that fits k)."""
+    from sglang.kernels.ops.attention.ordered_topk import ordered_topk
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+        torch_qsa_mqa_decode,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    torch.manual_seed(5)
+    max_pages, page_size, block_topk = 128, 16, 512
+    max_model_len = max_pages * page_size
+    lens = torch.tensor([1, 300, 511, 512, 513, 1000, 2047, 2048] * 4)
+    rows = lens.numel()
+    q, cache, page_table, lens = _decode_operands(
+        rows, max_pages, page_size, lens, device
+    )
+    ref = torch_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    # The caching allocator hands the NaN block to the unset logits, so a top-k
+    # that read an unscored row or a column past a length would show it.
+    poison = torch.full((rows, max_model_len), float("nan"), device=device)
+    del poison
+    out = tilelang_qsa_mqa_decode(
+        q, cache, page_table, lens, max_model_len, min_scored_len=block_topk
+    )
+    sel_ref = ordered_topk(ref, lens, topk=block_topk)
+    sel_out = ordered_topk(out, lens, topk=block_topk)
+    for row in range(rows):
+        length = int(lens[row])
+        if length <= block_topk:
+            assert torch.equal(sel_out[row], sel_ref[row])
+            continue
+        torch.testing.assert_close(
+            out[row, :length], ref[row, :length], rtol=2e-3, atol=2e-3
+        )
+    for a, b in zip(
+        _selected_score_multisets(ref, sel_ref), _selected_score_multisets(ref, sel_out)
+    ):
+        torch.testing.assert_close(a, b, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -409,6 +907,71 @@ def test_decode_selection_equivalent():
         ref_set = set(idx_ref[row][idx_ref[row] >= 0].tolist())
         new_set = set(idx_new[row][idx_new[row] >= 0].tolist())
         assert ref_set == new_set, f"row {row}: selection mismatch"
+
+
+def _ordered_block_reference(logits, starts, lengths, topk):
+    logits = logits.cpu()
+    expected = torch.full((logits.shape[0], topk), -1, dtype=torch.int32)
+    for row in range(logits.shape[0]):
+        start, length = int(starts[row]), int(lengths[row])
+        order = torch.argsort(
+            logits[row, start : start + length], descending=True, stable=True
+        )
+        count = min(length, topk)
+        expected[row, :count] = order[:count].sort().values.to(torch.int32)
+    return expected
+
+
+def test_block_topk_512_is_ordered_and_tie_stable():
+    """Block selection for k = 512 returned its indices in a different order on
+    every call and picked different blocks among equal scores at the cut-off.
+    It must return ascending indices and prefer the smaller index on a tie."""
+    from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
+
+    torch.manual_seed(11)
+    lengths = [1, 511, 512, 513, 2049, 8000]
+    logits = torch.randint(0, 32, (len(lengths), 8192), device="cuda").float()
+    starts = torch.arange(len(lengths), dtype=torch.int32, device="cuda") * 37
+    row_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    expected = _ordered_block_reference(logits, starts, row_lengths, 512)
+
+    for _ in range(4):
+        actual = qsa_fast_topk(logits, starts, starts + row_lengths, 512)
+        assert torch.equal(actual.cpu(), expected)
+
+
+def test_decode_block_selection_is_ordered_and_tie_stable(monkeypatch):
+    """Same contract on the decode path, which calls the top-k kernel directly
+    and scores only the first `lengths` entries of a row."""
+    from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+
+    torch.manual_seed(12)
+    lengths = torch.tensor([300, 512, 513, 4096], dtype=torch.int32, device="cuda")
+    logits = torch.randn(4, 4096, device="cuda").round()
+    columns = torch.arange(4096, device="cuda")[None, :]
+    # Past a row's length the decode scorer leaves the buffer unset.
+    logits.masked_fill_(columns >= lengths[:, None], 1e9)
+
+    def mock_mqa_decode(*args, min_scored_len):
+        assert min_scored_len == 512
+        return logits
+
+    monkeypatch.setattr(qsa_indexer_module, "qsa_mqa_decode", mock_mqa_decode)
+    expected = _ordered_block_reference(logits, torch.zeros(4), lengths, 512)
+
+    for _ in range(4):
+        actual = QSAIndexer.select_decode_tokens(
+            SimpleNamespace(block_topk=512),
+            q=logits,
+            compressed_cache=logits,
+            compressed_page_table=lengths,
+            compressed_lengths=lengths,
+            max_model_len=4096,
+            query_positions=lengths,
+            sequence_lengths=lengths,
+            defer_expansion=True,
+        )
+        assert torch.equal(actual.cpu(), expected)
 
 
 if __name__ == "__main__":
