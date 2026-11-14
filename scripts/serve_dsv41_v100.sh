@@ -109,8 +109,10 @@ if [[ "${SGLANG_DSV41_DSPARK}" == "1" ]]; then
   # load, but mem-fraction vacuums that into the KV pool — leftover for
   # the unpack stays ~12% of pre-load. 0.88 left TP7 with 284 MiB free
   # on a 461-token sticky prefill (need 300; 2026-09-20 manual eval).
-  # 0.87 keeps the 256k pool (draft leftover 4.53 GiB; 0.86 raises).
-  export SGLANG_DSV41_MEM_FRACTION="${SGLANG_DSV41_MEM_FRACTION:-0.87}"
+  # 0.87 kept the 256k pool (draft leftover 4.53 GiB; 0.86 raises) until the
+  # 0.10 GB image-cache reservation left it 512 tokens short. The pool is
+  # capped at the context, so 0.871 only adds ~1 MB of KV.
+  export SGLANG_DSV41_MEM_FRACTION="${SGLANG_DSV41_MEM_FRACTION:-0.871}"
   SPEC_FLAGS+=(--speculative-algorithm DSPARK --speculative-draft-model-path "${MODEL}")
   # Overlap off: each DSpark step waits on the host for its accepted length
   # (CSA2 commit), so the overlap loop hides nothing and runs one extra

@@ -32,6 +32,7 @@ from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
     csa2_image_len,
     evict_recent,
 )
+from sglang.srt.layers.attention.dsv4.sm70_csa2_session import log_rank0
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -228,7 +229,8 @@ class StickyLastSequenceCache(BasePrefixCache):
         if prefix_len <= 0:
             saved = self._match_saved_session(params, new_ids)
             if saved is None:
-                logger.info(
+                log_rank0(
+                    logger,
                     "sticky last-seq event=miss pinned=%d new=%d prefix=0 extend=%d cuts=%s",
                     len(self._last_ids),
                     len(new_ids),
@@ -263,7 +265,8 @@ class StickyLastSequenceCache(BasePrefixCache):
             request_load(self._parked)
 
         event = "exact" if exact else "prefix"
-        logger.info(
+        log_rank0(
+            logger,
             "sticky last-seq event=%s pinned=%d new=%d prefix=%d extend=%d cuts=%s",
             event,
             pinned_len,
@@ -313,7 +316,8 @@ class StickyLastSequenceCache(BasePrefixCache):
         ids = list(req.origin_input_ids) + list(req.output_ids[:finished_len])
         imaged = _imaged_len(len(req.origin_input_ids), len(ids))
         if imaged < len(ids):
-            logger.info(
+            # Normal at every turn end: the bonus token has no KV yet.
+            logger.debug(
                 "sticky last-seq pin stops at the CSA2 image: %d of %d tokens",
                 imaged,
                 len(ids),
@@ -332,8 +336,11 @@ class StickyLastSequenceCache(BasePrefixCache):
         self._last_ids = tuple(ids)
         self._last_extra_key = getattr(req, "extra_key", None)
         self._last_cache_salt = getattr(req, "cache_salt", None) or None
-        logger.info(
-            "sticky last-seq pin %d tokens cuts=%s", len(self._last_ids), self._cuts
+        log_rank0(
+            logger,
+            "sticky last-seq pin %d tokens cuts=%s",
+            len(self._last_ids),
+            self._cuts,
         )
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs):
@@ -343,7 +350,7 @@ class StickyLastSequenceCache(BasePrefixCache):
             # is not in the CSA2 image yet; the snap is ``up_to``, which
             # checkpoint_kv_cache passes as extend_end.
             self._note_cut(ids, stop=up_to)
-            logger.info(
+            logger.debug(
                 "sticky last-seq stop %d tokens cuts=%s",
                 self._cuts[-1] if self._cuts else 0,
                 self._cuts,
@@ -506,7 +513,8 @@ class StickyLastSequenceCache(BasePrefixCache):
             self._drop_slot("health check")
             return
         self._parked = key
-        logger.info(
+        log_rank0(
+            logger,
             "sticky last-seq park %d tokens in session %s for a health check",
             len(self._last_ids),
             key[:12],
@@ -609,7 +617,8 @@ class StickyLastSequenceCache(BasePrefixCache):
         ]
         self._last_extra_key = meta.get("extra_key")
         self._last_cache_salt = meta.get("cache_salt") or None
-        logger.info(
+        log_rank0(
+            logger,
             "sticky last-seq event=session pinned=%d new=%d prefix=%d extend=%d cuts=%s",
             len(saved_ids),
             len(params.key.raw_token_ids()),
@@ -719,7 +728,8 @@ class StickyLastSequenceCache(BasePrefixCache):
         if pin_len not in self._cuts:
             self._cuts.append(pin_len)
         self._cuts = evict_recent(self._cuts, BOUNDARY_KEEP)
-        logger.info(
+        log_rank0(
+            logger,
             "sticky last-seq pin %d tokens cuts=%s (abort)",
             pin_len,
             self._cuts,
@@ -767,7 +777,7 @@ class StickyLastSequenceCache(BasePrefixCache):
             return
         self.free_kv_row(slot.kv, [(0, slot.kv.kv_allocated_len)])
         self.req_to_token_pool.free(slot)
-        logger.info("sticky last-seq drop (%s)", reason)
+        log_rank0(logger, "sticky last-seq drop (%s)", reason)
 
     def _free_tail(self, kv: ReqKvInfo, prefix_len: int) -> None:
         self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)

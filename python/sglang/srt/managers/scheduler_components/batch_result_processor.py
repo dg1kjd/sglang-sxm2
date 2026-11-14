@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
+    get_parallel,
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_params import (
@@ -90,7 +91,8 @@ logger = logging.getLogger(__name__)
 
 def _log_dsv41_prefill_done(req) -> None:
     """Phase-1 line: how much of this prefill was already cached, and how long it took."""
-    if not envs.SGLANG_DSV41_STICKY_LAST_SEQ.get():
+    # TP rank 0 only: every rank finishes the same prefill.
+    if not envs.SGLANG_DSV41_STICKY_LAST_SEQ.get() or get_parallel().tp_rank != 0:
         return
     stats = getattr(req, "time_stats", None)
     start = float(getattr(stats, "forward_entry_time", 0.0) or 0.0)

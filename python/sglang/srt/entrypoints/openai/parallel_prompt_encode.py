@@ -54,8 +54,10 @@ _MIN_CHUNK_CHARS = 2048
 _MAX_CHUNKS = 64
 
 # Per tokenizer; a text longer than the entry limit is encoded but not kept.
+# One message can hold most of a long context; at 1/8 (131,072 tokens) a 190k
+# message was encoded again on every turn (~350 ms when encode_batch is serial).
 _SEGMENT_CACHE_MAX_TOKENS = 1 << 20
-_SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 8
+_SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 2
 
 # Pre-tokenizers that act on each piece independently of its position in the
 # sequence. Metaspace (prepend_scheme="first") and anything unknown are not.

@@ -7,6 +7,7 @@ OpenAIServingChat for processing, and converts responses back to Anthropic forma
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -36,6 +37,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     MessageDeltaEvent,
     MessageStartEvent,
     MessageStopEvent,
+    PingEvent,
     SignatureDelta,
     TextBlock,
     TextDelta,
@@ -158,6 +160,39 @@ def _extract_system_text(
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
     return f"event: {event_type}\ndata: {data}\n\n"
+
+
+# Claude Code 2.1.322 warns after 45 s without body bytes and retries after 300 s;
+# a long prefill or a buffered tool call is that quiet. Anthropic's API pings too.
+_STREAM_PING_INTERVAL_S = 10.0
+
+
+async def _with_pings(
+    stream: AsyncGenerator[str, None], interval_s: float
+) -> AsyncGenerator[Optional[str], None]:
+    """Pass the stream through; yield None after each interval_s without an item."""
+    stream_iter = stream.__aiter__()
+    context = contextvars.copy_context()
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.get_running_loop().create_task(
+                    stream_iter.__anext__(), context=context
+                )
+            done, _ = await asyncio.wait({pending}, timeout=interval_s)
+            if not done:
+                yield None
+                continue
+            step, pending = pending, None
+            try:
+                item = step.result()
+            except StopAsyncIteration:
+                return
+            yield item
+    finally:
+        if pending is not None:
+            pending.cancel()
 
 
 def _scrub_error_message(message: str, status_code: int) -> str:
@@ -1097,7 +1132,7 @@ class AnthropicServing:
         # the client would see a half-open SSE / TCP close. Catch them here
         # and emit a clean Anthropic error sequence instead.
         try:
-            stream_iter = openai_stream.__aiter__()
+            stream_iter = _with_pings(openai_stream, _STREAM_PING_INTERVAL_S).__aiter__()
         except Exception as e:
             logger.exception("Failed to open OpenAI stream: %s", e)
             for frame in _flush_on_error("api_error", "Internal server error"):
@@ -1127,6 +1162,10 @@ class AnthropicServing:
                 for frame in _flush_on_error("api_error", "Internal server error"):
                     yield frame
                 return
+
+            if sse_line is None:
+                yield _emit(PingEvent())
+                continue
 
             if not sse_line.startswith("data: "):
                 continue

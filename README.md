@@ -31,25 +31,23 @@ Each model page has the full measurements, the exact launch recipe, and why each
 
 ## Performance
 
-Measured on 8× V100-SXM2-32GB (two NVLink quads joined by bridges), one request at a time unless noted, temperature 0.
+Measured on 8× V100-SXM2-32GB (two NVLink quads joined by bridges), one request at a time unless noted, temperature 0. The model pages have the full measurements.
 
 ### GLM-5.3-Flash: fast tool-call turns
 
-In an agent loop most turns append a tool result of a few hundred tokens to a long conversation. Those turns only prefill the new tokens, so the answer starts in well under a second up to 128k context and in about a second at 190k.
+In an agent loop most turns append a tool result of a few hundred tokens to a long conversation. Those turns only prefill the new tokens, so the answer starts in well under a second, up to 190k context from the second tool turn on.
 
 | Conversation length | First turn (cold) | Each following tool-call turn |
 |---|---:|---:|
 | 32k tokens | 16 s | 0.52–0.60 s |
 | 128k tokens | 67 s | 0.62–0.71 s |
-| 190k tokens | 103 s | 1.03–1.15 s |
+| 190k tokens | 110 s | 0.64–1.17 s |
 
-- **Decode:** ~177 tok/s (154–199 across six prompt types), with MTP accepting ~2.9 tokens per step.
-- **Images and video cost no context.** The vision tower runs from host memory. A 2048×1536 image takes ~3 s, a 3840×2160 one ~6 s, a 60 s 720p video ~23 s.
-- **Subagents don't evict the main session.** Two conversations stay cached side by side. With a 190k main session, a fresh 17k subagent costs ~8.5 s once, then ~0.5 s per turn, and the next main turn answers in ~1 s without prefilling the main session again.
+- **Decode:** ~177 tok/s, with MTP accepting ~2.9 tokens per step.
+- **Images and video cost no context.** The vision tower runs from host memory. A 3840×2160 image takes ~6 s.
+- **Subagents don't evict the main session.** With a 190k main session, a fresh 17k subagent costs ~8.5 s once, and the next main turn answers in ~1 s without prefilling the main session again.
 
 ### Qwen3.8-Flash-Next: fast tool-call turns on four cards
-
-The same agent-loop test as GLM, on half the GPUs.
 
 | Conversation length | First turn (cold) | Each following tool-call turn |
 |---|---:|---:|
@@ -57,14 +55,14 @@ The same agent-loop test as GLM, on half the GPUs.
 | 128k tokens | 31 s | 0.45–0.60 s |
 | 190k tokens | 46 s | 0.48–0.51 s |
 
-- **Decode:** ~167 tok/s for one stream (155–196 across the same six prompts as GLM), with MTP accepting ~2.9 tokens per step. Up to three streams run at once, but two together are no faster than one (153 tok/s total); three reach 193.
-- **Subagents don't evict the main session.** With a 190k main session, a fresh 19k subagent costs ~4.5 s once, then 0.36–0.43 s per turn, and the next main turn still answers in ~0.5 s.
+- **Decode:** ~167 tok/s for one stream, with MTP accepting ~2.9 tokens per step. Up to three streams run at once.
+- **Subagents don't evict the main session.** With a 190k main session, a fresh 19k subagent costs ~4.5 s once, and the next main turn still answers in ~0.5 s.
 
 ### DeepSeek-V4.1-Flash: the most capable model, running locally
 
 DeepSeek-V4.1-Flash is the strongest model here for reasoning and world knowledge. It runs from the official checkpoint, with Engram tables in host RAM, experts spilled to the host, and sparse attention, on hardware it was never meant for. As far as we know, no other engine runs it on V100s, let alone for local agentic coding. It has carried a multi-hour Claude Code session.
 
-It is slow: about 11 tok/s on short code, about 7 on prose, and ~560 tok/s warm prefill. The resident conversation is never re-prefilled. A turn that adds a few dozen tokens reaches its first token in about 1 s, one that adds a 700-token tool result in about 3 s.
+It is slow: about 11 tok/s on short code, about 7 on prose. The resident conversation is never re-prefilled, so a turn that adds a 700-token tool result reaches its first token in about 3 s.
 
 ### MiniMax-H3
 
@@ -80,7 +78,7 @@ On 4 GPUs, a 5 s 960×544 clip takes 50 steps of 10–12 s each. A 5 s 1344×768
 ## Requirements
 
 - **GPUs:** V100 with **32 GB**. SXM2 with NVLink is the measured setup. PCIe V100s run the same scripts, slower; GLM and Qwen need the interconnect switches under "PCIe V100s" on their pages.
-- **Host RAM:** GLM ~23 GB in use, up to ~6 GB more with images (vision tower and image cache, pinned). Qwen ~134 GB in use with the host KV tier, so plan for 160 GB. DeepSeek needs ~190 GiB on 1 GiB hugepages for Engram plus ~104 GiB of pinned expert spill. H3 keeps the text encoder and VAEs on the host.
+- **Host RAM:** GLM ~23 GB, up to ~29 GB with images. Qwen ~134 GB with the host KV tier, so plan for 160 GB. DeepSeek ~300 GiB (Engram on 1 GiB hugepages plus pinned expert spill). Each model page has the breakdown.
 - **Disk:** GLM 190 GB, Qwen 126 GB, DeepSeek 476 GB, plus the H3 checkpoint.
 - **CUDA 12.8 or 12.9.** CUDA 13 dropped Volta.
 - **GCC ≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, which many distros now default to.
@@ -112,7 +110,7 @@ docker compose -f docker/v100-compose.yaml build glm53  # about an hour; one ima
 docker compose -f docker/v100-compose.yaml up glm53     # or qwen38, dsv41, h3
 ```
 
-Checkpoints are read from `MODELS_DIR` (default `~/models`) under the directory names used in [Run](#run). JIT kernels and caches persist in a Docker volume, so only the first launch compiles (about 10 minutes for GLM). Overrides such as `SGLANG_V100_PORT` or `GLM53_GPUS` pass through from the shell. DeepSeek-V4.1-Flash still needs the 1 GiB hugepages reserved on the host. [INSTALL.md](docs/v100/INSTALL.md#docker) describes how the image and the compose file are put together and how to run each model.
+Checkpoints are read from `MODELS_DIR` (default `~/models`) under the directory names used in [Run](#run). DeepSeek-V4.1-Flash still needs the 1 GiB hugepages reserved on the host. [INSTALL.md](docs/v100/INSTALL.md#docker) has the details.
 
 ## Run
 
@@ -165,11 +163,10 @@ These models reason before they answer. An empty `content` with a large `complet
 ## Limitations
 
 - **One agent session per server** for GLM and DeepSeek (`--max-running-requests 1`). Further requests queue. Qwen takes up to three streams.
-- **DeepSeek-V4.1-Flash keeps one conversation resident.** A new conversation prefills from scratch. The last four are kept on disk, so returning to one of them loads it back instead of prefilling it again. A long uncached suffix runs at about 300 tok/s.
-- **GLM tool turns at 190k got slower** (1.03–1.15 s, 0.60–0.77 s on 2026-10-02) somewhere between 10-02 and 11-11; 32k and 128k are unchanged. Not found yet.
-- **Not soaked for days.** Qwen ran an hour of mixed load tests and DeepSeek a multi-hour Claude Code session. GLM is checked with benchmarks and GSM8K, with no multi-hour soak yet.
+- **DeepSeek-V4.1-Flash keeps one conversation resident** (the last four on disk). A new conversation prefills from scratch, and a long uncached suffix runs at about 300 tok/s.
+- **GLM: the first tool turn after a cold 190k prompt takes ~1.15 s** (the next ones 0.64–0.70 s). Not found yet.
+- **Not soaked for days.** DeepSeek carried a multi-hour Claude Code session and Qwen an hour of mixed load. GLM has no multi-hour soak yet.
 - **Volta has no bf16 and no FP4/FP8 hardware.** Everything runs as fp16 with weight-only 4/8-bit kernels, so numerics differ slightly from a Hopper run of the same checkpoint.
-- **Claude Code can show "No response from the API after …"** while a long fresh prompt is still prefilling (seen on DeepSeek-V4.1-Flash with Claude Code's system prompt). With `API_TIMEOUT_MS` set as above it keeps waiting. Without it, Claude Code retries the request, and long prefills can make it unusable.
 
 ## Relationship to SGLang
 
@@ -179,23 +176,7 @@ Report bugs in the Volta path here. Report bugs in SGLang itself upstream.
 
 ## Credits
 
-Built on [SGLang](https://github.com/sgl-project/sglang) (Apache 2.0, SGLang Team), which does the hard part.
-
-Incorporates work from:
-
-- **[haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100)**: the original Volta port of SGLang, including the TileLang attention backend, the QSA and GDN kernels, the NVFP4 path for hardware without FP4, the TurboMind sm70 integration and the PLE host offload. Also [haohervchb/flashinfer](https://github.com/haohervchb/flashinfer) (sm70 FlashInfer) and [GooseLLM](https://github.com/haohervchb/GooseLLM) (TileLang FlashAttention for V100). Their November follow-ups make `can_p2p` check every peer and validate the PCIe byte cap, and their V100 backport of the QSA pending-ring fix pointed at the parts an older base lacks. Ported from their Qwen3.8 work after that: QSA chunk-prefill reads an FP16 KV pool directly, the fused shared-expert gate runs 2 and 4 rows, and a test for a prefill shorter than one compression group. Their findings that the Triton vision attention is the slow part of image requests on Volta, and that image preprocessing can be kept off the GPU, led to the TileLang vision backend and the `SGLANG_FORCE_CPU_IMAGE_PREPROCESSING` fix here. Ported from their later Qwen3.8 decode and prefill work: NVFP4 MoE decode in two kernels instead of four, the fused QSA indexer prep with the fp16 RoPE cache, and long QSA prefill rows scored on one TP rank each.
-- **[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)**: the vLLM fork for V100 whose TurboMind sm70 block-FP8 and FP16 MoE backend the build compiles.
-- **[Horacio Vico](https://github.com/hvico)** ([hvico/sglang-V100](https://github.com/hvico/sglang-V100)): the opt-in custom all-reduce over PCIe P2P for GPUs without NVLink (`SGLANG_CUSTOM_AR_ALLOW_PCIE`).
-- **[ltarcher](https://github.com/ltarcher)** ([ltarcher/sglang-v100-qwen3.8-flash-next](https://github.com/ltarcher/sglang-v100-qwen3.8-flash-next)): the import guards that treat an installed but unloadable DeepGEMM wheel as missing, and the measurement showing that `NCCL_P2P_LEVEL=NVL` slows PCIe-only cards, after which the scripts leave that choice to NCCL.
-- **[Divy Vasal](https://github.com/divyvasal)** ([sgl-project/sglang#42812](https://github.com/sgl-project/sglang/pull/42812)): DSpark's accept step returns copies instead of views of buffers that the next verify step overwrites, so tensor-parallel ranks cannot commit different token counts under the overlap scheduler.
-- **[Andy Liu](https://github.com/andyl98)** ([sgl-project/sglang#46125](https://github.com/sgl-project/sglang/pull/46125)): sizes the QSA pending-key ring for speculative verify and draft extend, which overwrote group members before they were compressed (Qwen3.8-Flash-Next with MTP).
-- **[aaahzb](https://github.com/aaahzb)** ([aaahzb/sglang-sxm2](https://github.com/aaahzb/sglang-sxm2)): install fixes from a fresh CUDA 12.8 setup (libssl-dev, CMake 3.26, the TurboMind source subset, the Marlin bf16 patch on CUDA 12.8+).
-- **[That80-20](https://github.com/That80-20)** ([issue #5](https://github.com/dg1kjd/sglang-sxm2/issues/5)): found that a fresh install missed a TurboMind header (`csrc/sm70_tile_runtime_signal.cuh`) and that the installer stopped on a host without Rust, with the fix for both.
-- **[frankier](https://github.com/frankier)** ([frankier/sglang-sxm2](https://github.com/frankier/sglang-sxm2)): their GLM-5.3 vision work suggested checking at launch that the image processor imports, and running the vision tower one image at a time.
-
-Volta kernels by: [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy), [marlin_v100](https://github.com/zhinianqin/marlin_v100), [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100), [v100-skinny](https://github.com/dnv2003/v100-skinny) (QPN8 FP8 decode GEMV), [CUTLASS](https://github.com/NVIDIA/cutlass), [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and [TileLang](https://github.com/tile-ai/tilelang).
-
-None of these are redistributed here. The installer fetches them at pinned revisions. See [NOTICE](NOTICE) for licenses.
+Built on [SGLang](https://github.com/sgl-project/sglang) (Apache 2.0, SGLang Team), which does the hard part. Everyone else whose work is in this fork, and the Volta kernels the installer fetches, are listed in [CREDITS.md](CREDITS.md).
 
 ## License
 

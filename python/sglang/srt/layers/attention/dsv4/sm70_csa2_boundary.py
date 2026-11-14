@@ -31,6 +31,8 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 
+from sglang.srt.layers.attention.dsv4.sm70_csa2_session import log_rank0
+
 logger = logging.getLogger(__name__)
 
 # Newest stops kept. Scheduler and worker both call ``evict_recent`` so a
@@ -334,7 +336,8 @@ class Csa2BoundaryStore:
         for length in [n for n in self.history if n not in self.order]:
             del self.history[length]
         self.tip_from_extend = False
-        logger.info(
+        # Every prefill chunk and every stop; the turn's pin line says the same.
+        logger.debug(
             "csa2 boundary freeze len=%d history=%s", self.tip_len, self.order
         )
 
@@ -365,7 +368,7 @@ class Csa2BoundaryStore:
         if self.tip_len > length:
             self.tip = {}
             self.tip_len = int(length)
-        logger.info("csa2 boundary restore len=%d", length)
+        log_rank0(logger, "csa2 boundary restore len=%d", length)
 
 
 # This rank's target store. The scheduler runs in the same process and asks
@@ -399,7 +402,9 @@ def _cut_tip_to_pin(
 ) -> None:
     tip = store.tip_len
     if store.trim_tip(paired, pin):
-        logger.info("csa2 boundary trim verify snap %d to pin %d%s", tip, pin, when)
+        log_rank0(
+            logger, "csa2 boundary trim verify snap %d to pin %d%s", tip, pin, when
+        )
         return
     logger.warning(
         "csa2 boundary relabel verify snap %d as pin %d%s: no image to cut "
@@ -449,7 +454,7 @@ def _file_spill_under_pin(
         store.resident_end = pin
     if store.tip_len == worker_len:
         store.tip_len = pin
-    logger.info("csa2 boundary move snap %d onto pin %d", worker_len, pin)
+    log_rank0(logger, "csa2 boundary move snap %d onto pin %d", worker_len, pin)
 
 
 def csa2_prepare_extend(backends: Sequence, start: int) -> None:
@@ -473,7 +478,8 @@ def csa2_prepare_extend(backends: Sequence, start: int) -> None:
         save_resident(paired, store, spill)
     if start <= 0:
         if store.resident_end or store.history or store.tip_len:
-            logger.info(
+            log_rank0(
+                logger,
                 "csa2 boundary clear (prefix 0, had resident=%d)",
                 store.resident_end,
             )

@@ -2701,6 +2701,50 @@ null
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertIsInstance(result, StreamingParseResult)
 
+    def test_streaming_text_never_lands_inside_a_calls_fragments(self):
+        """Callers send an increment's normal_text before its calls, and a client closes an open
+        call on text (Anthropic adapter), so no text may come out between a call's first and last
+        fragment: not text after the call in the same increment, not newlines between the tags
+        of a call opened by a bare <function=...> without <tool_call>."""
+        call = (
+            "<function=get_current_weather>\n<parameter=location>\n{city}\n"
+            "</parameter>\n</function>"
+        )
+        wrapped = "<tool_call>\n" + call + "\n</tool_call>"
+        cases = [
+            (
+                "Checking both.\n" + wrapped.format(city="Paris") + "\n"
+                + wrapped.format(city="Oslo") + "\nDone.",
+                "Checking both.\n\n\nDone.",
+            ),
+            (
+                "Checking both.\n" + call.format(city="Paris") + "\n"
+                + call.format(city="Oslo") + "\nDone.",
+                "Checking both.\n\n\nDone.",
+            ),
+        ]
+        for text, expected_text in cases:
+            for size in range(1, len(text) + 1):
+                detector = Qwen3CoderDetector()
+                events = []
+                results = [
+                    detector.parse_streaming_increment(text[i : i + size], self.tools)
+                    for i in range(0, len(text), size)
+                ]
+                for result in results + [detector.finish(self.tools)]:
+                    if result.normal_text:
+                        events.append(("text", None, result.normal_text))
+                    events += [("call", c.tool_index, c.parameters) for c in result.calls]
+
+                where = f"{text[:40]!r} size {size}"
+                text_out = "".join(e[2] for e in events if e[0] == "text")
+                self.assertEqual(text_out, expected_text, where)
+                for tool_index, city in ((0, "Paris"), (1, "Oslo")):
+                    spans = [i for i, e in enumerate(events) if e[:2] == ("call", tool_index)]
+                    self.assertEqual(spans, list(range(spans[0], spans[-1] + 1)), where)
+                    args = "".join(events[i][2] for i in spans)
+                    self.assertEqual(json.loads(args), {"location": city}, where)
+
     def test_nested_anyof_array_with_multiple_types_parameter_conversion(self):
         """
         Test several edge cases of parameter conversion for nullable anyOf schemas.

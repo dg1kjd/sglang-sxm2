@@ -3,6 +3,7 @@ import json
 import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -17,6 +18,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
+from sglang.srt.entrypoints.anthropic import serving as anthropic_serving  # noqa: E402
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
 from sglang.srt.entrypoints.openai.chat_encoding import (  # noqa: E402
     spec_supports_inline_system,
@@ -759,6 +761,56 @@ class TestAnthropicServing(unittest.TestCase):
         error_event = events[1]
         self.assertEqual(error_event["error"]["type"], "api_error")
         self.assertIn("no content", error_event["error"]["message"].lower())
+
+    def test_stream_pings_while_backend_is_silent(self):
+        """A silent prefill must still put ping events on the wire, before message_start."""
+        serving = self._serving()
+
+        async def _slow_stream(*_args):
+            await asyncio.sleep(0.25)
+            yield _chunk([_choice({"role": "assistant", "content": "ok"})])
+            yield _chunk([_choice({}, finish_reason="stop")])
+            yield "data: [DONE]\n\n"
+
+        serving.openai_serving_chat._generate_chat_stream = _slow_stream
+        with mock.patch.object(anthropic_serving, "_STREAM_PING_INTERVAL_S", 0.05):
+            events = asyncio.run(
+                _collect_anthropic_events(serving, self._anthropic_request())
+            )
+        types = [event["type"] for event in events]
+        start = types.index("message_start")
+        self.assertGreaterEqual(start, 2)
+        self.assertEqual(set(types[:start]), {"ping"})
+        self.assertNotIn("ping", types[start:])
+        self.assertEqual(types[-2:], ["message_delta", "message_stop"])
+
+    def test_stream_cancel_while_pinging_cancels_backend_read(self):
+        """A client disconnect during a silent prefill must cancel the pending backend read."""
+        serving = self._serving()
+        state = {}
+
+        async def _silent_stream(*_args):
+            try:
+                await asyncio.sleep(10)
+                yield "data: [DONE]\n\n"
+            finally:
+                state["closed"] = True
+
+        serving.openai_serving_chat._generate_chat_stream = _silent_stream
+
+        async def _run():
+            task = asyncio.ensure_future(
+                _collect_anthropic_events(serving, self._anthropic_request())
+            )
+            await asyncio.sleep(0.12)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.01)
+            self.assertTrue(state.get("closed"))
+
+        with mock.patch.object(anthropic_serving, "_STREAM_PING_INTERVAL_S", 0.05):
+            asyncio.run(_run())
 
     def test_cache_read_exceeds_prompt_tokens_clamps_to_zero(self):
         """When cached_tokens > prompt_tokens, input_tokens clamps to 0 instead of going negative."""

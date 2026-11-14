@@ -747,6 +747,24 @@ class TestPromptSegments(_EncodeCase):
         self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
         self.assertNotIn("hello world " * 30, encoder.cache)
 
+    def test_one_message_as_long_as_a_long_context_stays_cached(self):
+        """A single ~200k-token message must stay cached; otherwise every turn
+        of a long agent session encodes it again."""
+        long_message = "hello world " * 70_000
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            for turn in range(2):
+                segments = ["<|user|>", long_message, "<|assistant|>", f"turn {turn}"]
+                ppe.encode_prompt_segments(self.tokenizer, segments)
+        self.assertEqual(
+            [call.args[1] for call in encode.call_args_list],
+            [[long_message, "turn 0"], ["turn 1"]],
+        )
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

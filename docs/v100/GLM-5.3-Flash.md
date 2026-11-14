@@ -60,9 +60,9 @@ The reference recipe below: TP=8, MTP 3 steps / 4 draft tokens, `--max-running-r
 |---|---:|---:|
 | 32,203 tokens | 15.8 s | 603 / 523 / 525 ms |
 | 128,203 tokens | 66.9 s | 706 / 615 / 633 ms |
-| 190,203 tokens | 103.2 s | 1148 / 1031 / 1036 ms |
+| 190,203 tokens | 109.8 s | 1166 / 704 / 638 ms |
 
-At 190k the tool turns are slower than on 2026-10-02 (768 / 702 / 602 ms); 32k and 128k are about the same. The change came between 2026-10-02 and 2026-11-11 and is not found yet. Rendering and tokenizing the whole chat takes about 0.5 s of each turn at 190k (0.35 s at 128k).
+The 190k row was measured again on 2026-11-13 with the tokenizer cache fix: the server encodes a GLM-5.3 chat message by message and caches each message, but kept none longer than 131,072 tokens, so a 190k first message was encoded again on every turn (about 0.35 s). Before the fix the same run gave 1134 / 989 / 934 ms. The first tool turn after the cold prompt still takes about 1.15 s (768 ms on 2026-10-02); not found yet.
 
 **Main session plus subagents** (2026-11-12). A 190k main conversation, then two fresh ~17k subagent conversations of three turns each, with a main turn after each subagent. The main turns stay cached:
 
@@ -191,7 +191,7 @@ Without MTP (`GLM53_MTP_STEPS=0` in the wrapper): drop the five `--speculative-*
 - One request at a time. A second request queues behind the first.
 - Videos are capped at 32,768 tokens per request (`GLM53_VIDEO_MAX_TOKENS`).
 - A fresh subagent conversation pays its own cold prefill (about 8.5 s at 17k tokens).
-- Tool turns at 190k take about 1.0–1.15 s, against 0.6–0.77 s on 2026-10-02; not found yet.
+- The first tool turn after a cold 190k prompt takes about 1.15 s (768 ms on 2026-10-02); the next ones take 0.64–0.70 s. Not found yet.
 - The first request with a new set of tools compiles its tool-call grammar, about 7 s once per tool set.
 - Checked with the benchmarks above and GSM8K (0.926 over 1,319 questions, 5-shot, greedy, with MTP; 2026-11-12). No multi-hour soak yet.
 

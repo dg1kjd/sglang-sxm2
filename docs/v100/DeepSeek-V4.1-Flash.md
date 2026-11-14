@@ -94,7 +94,7 @@ python -m sglang.launch_server \
   --attention-backend dsv4 \
   --context-length 262144 \
   --chunked-prefill-size 2048 \
-  --mem-fraction-static 0.87 \
+  --mem-fraction-static 0.871 \
   --engram-config '{"placement": "cpu", "replication": "none"}' \
   --max-running-requests 1 \
   --max-total-tokens 262144 \
@@ -122,7 +122,7 @@ python -m sglang.launch_server \
 | sticky last-seq | on | One resident conversation. Exact continuation, or a shorter prefix saved at a chunk or request stop. Anything else drops the pin and prefills from 0, unless it continues a stored conversation (next row). Radix stays off (a radix hit desyncs CSA2 pending state) |
 | conversation store | on, last 4 kept | When a request starts a different conversation, the resident one's sparse-attention state is written to disk (`SGLANG_DSV41_CSA2_SESSION_DIR`, `SGLANG_DSV41_CSA2_SESSION_KEEP`). A later request that continues a stored conversation from a recorded stop loads it back instead of prefilling from 0. Switching away and back, a 300-token continuation of a 3k-token conversation reached its first token in 3.1 s, against 9.5 s to prefill the 3k tokens cold (2026-10-07) |
 | context / max tokens | 262144 | Advertised window. 8k, 32k and 250k prefills are smoked (250k takes about 17 minutes); 512k has not left ~300 MiB for the Engram MXFP8 unpack |
-| `--mem-fraction-static` | 0.87 | 0.99 OOMs the Engram unpack on T=6 verify capture. 0.88 OOMed the same 300 MiB unpack on a 461-token sticky prefill (TP7 had 284 MiB). 0.86 raises: no KV pool after draft weights |
+| `--mem-fraction-static` | 0.871 | 0.99 OOMs the Engram unpack on T=6 verify capture. 0.88 OOMed the same 300 MiB unpack on a 461-token sticky prefill (TP7 had 284 MiB). 0.86 raises: no KV pool after draft weights. 0.87 leaves the pool 512 tokens short of 262,144 since the 0.10 GB image-cache reservation; the pool is capped at the context, so 0.871 adds only ~1 MB of KV |
 | expert spill | 13 GiB/rank (landing 36) | Spill 12 left 8k ~8 MiB short of that unpack |
 | prefill landing | on | Prefill copies the spilled experts a chunk uses into the landing slots, with no swap back to host. 8.3k cold prefill 25 s (42 s with the swap), 300-700-token follow-ups 2.3-3.3 s to the first token (5-6 s with the swap). `SGLANG_DSV41_PREFILL_LANDING=0` restores the GPU-slot swap |
 | expert cold set | `scripts/dsv41_flash_cold_set_ep8.json` | Picks which 18 of each GPU's 48 experts per layer live in host memory: the least used on a recorded prompt set (file review, coding, agent turns, reasoning). On held-out requests that is 19 expert reads from host per decoded token instead of 91. An empty `SGLANG_DSV41_EXPERT_SPILL_COLD_SET=` keeps the last experts of each GPU on the host instead |

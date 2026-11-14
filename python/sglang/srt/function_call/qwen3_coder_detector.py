@@ -463,11 +463,18 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # or a newline between two tags.
             # But we need to be careful not to output truncated tags like "<fun" as text.
 
+            # Text after this increment's calls waits for the next increment (or finish()):
+            # callers send normal_text before calls, which would split the last call's fragments.
+            # A call opened by a bare <function=...> (no <tool_call>) is a call region too.
+            in_call = self.is_inside_tool_call or self.current_func_name is not None
+            if calls and not in_call:
+                break
+
             next_open_angle = current_slice.find("<")
 
             if next_open_angle == -1:
                 # This entire segment is plain text
-                if not self.is_inside_tool_call:
+                if not in_call:
                     normal_text_chunks.append(current_slice)
                 # [FIX] If inside tool call, discard this text (usually \n), don't append
                 self.parsed_pos += len(current_slice)
@@ -495,7 +502,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     break  # Wait for more
                 else:
                     # Just a plain '<' symbol
-                    if not self.is_inside_tool_call:
+                    if not in_call:
                         normal_text_chunks.append("<")
                     self.parsed_pos += 1
                     continue
@@ -503,7 +510,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             else:
                 # '<' is in the middle
                 text_segment = current_slice[:next_open_angle]
-                if not self.is_inside_tool_call:
+                if not in_call:
                     normal_text_chunks.append(text_segment)
                 # [FIX] If inside tool call, discard whitespace/text before Tag
                 self.parsed_pos += next_open_angle
@@ -517,6 +524,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         normal_text = "".join(normal_text_chunks) if normal_text_chunks else ""
         return StreamingParseResult(calls=calls, normal_text=normal_text)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text held back after the last increment's calls, and any calls after it."""
+        text, calls = [], []
+        while True:
+            result = self.parse_streaming_increment("", tools)
+            if not result.normal_text and not result.calls:
+                break
+            text.append(result.normal_text)
+            calls.extend(result.calls)
+        return StreamingParseResult(normal_text="".join(text), calls=calls)
 
     def supports_structural_tag(self) -> bool:
         return True

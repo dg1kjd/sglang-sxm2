@@ -54,6 +54,11 @@ def rank_id() -> int:
     return 0
 
 
+def log_rank0(log: logging.Logger, msg: str, *args) -> None:
+    """INFO on TP rank 0; the other ranks hold the same state and log it at DEBUG."""
+    log.log(logging.INFO if rank_id() == 0 else logging.DEBUG, msg, *args)
+
+
 def session_key(
     ids: Sequence[int], extra_key: Optional[str], cache_salt: Optional[str]
 ) -> str:
@@ -220,7 +225,7 @@ def _delete(key: str) -> None:
             path.unlink()
         except FileNotFoundError:
             pass
-    logger.info("csa2 session evict key=%s", key[:12])
+    log_rank0(logger, "csa2 session evict key=%s", key[:12])
 
 
 def _cpu_map(src: Dict[int, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -272,7 +277,8 @@ def save_resident(paired: Sequence[tuple], store, key: str) -> None:
     # Workaround: torch.save (2.9.1) leaves its pickler class in a reference
     # cycle holding every saved storage; drop once torch.save frees them itself.
     gc.collect()
-    logger.info(
+    log_rank0(
+        logger,
         "csa2 session spill key=%s len=%d cuts=%s",
         key[:12],
         store.resident_end,
@@ -355,7 +361,8 @@ def load_resident(paired: Sequence[tuple], store, key: str) -> bool:
     store.tip_from_extend = False
     store.trail = []
     _touch(_stems(key)[0])
-    logger.info(
+    log_rank0(
+        logger,
         "csa2 session load key=%s len=%d cuts=%s",
         key[:12],
         store.resident_end,

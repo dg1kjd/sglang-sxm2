@@ -3764,23 +3764,26 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
             if flush:
                 end = parser.finish(effective_tools)
-                normal_text = (normal_text or "") + end.normal_text
-                calls = list(calls) + end.calls
+                end_text, end_calls = end.normal_text, end.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:
                 end_text, end_calls = parser.parse_stream_end()
+        tail_text = ""
+        if flush:
+            # Text released at the end follows this delta's calls; sent before them it would
+            # split a call's argument fragments (the Anthropic adapter drops the rest).
+            if calls:
+                tail_text = end_text
+            else:
                 normal_text = (normal_text or "") + end_text
-                calls = list(calls) + end_calls
+            calls = list(calls) + end_calls
 
-        # Yield normal text
-        if normal_text:
+        def _content_chunk(text: str) -> str:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
-                delta=DeltaMessage(content=normal_text),
-                internal_content=wire.internal_content(
-                    index, normal_text, kind="content"
-                ),
+                delta=DeltaMessage(content=text),
+                internal_content=wire.internal_content(index, text, kind="content"),
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -3802,7 +3805,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
+            return f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
+
+        if normal_text:
+            yield _content_chunk(normal_text)
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -3879,6 +3885,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
 
                 yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
+
+        if tail_text:
+            yield _content_chunk(tail_text)
 
     def _check_for_unstreamed_tool_args(
         self,
