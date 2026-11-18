@@ -186,6 +186,8 @@ class _MockTokenizerManager:
 
     def __init__(self):
         self.model_config = Mock(is_multimodal=False, vocab_size=32000)
+        self.model_config.get_default_sampling_params.return_value = {}
+        self.preferred_sampling_params = None
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
@@ -2305,6 +2307,30 @@ class ServingChatTestCase(CustomTestCase):
             ],
             [8, 9],
         )
+
+    def test_preferred_sampling_params_fill_unset_chat_fields(self):
+        """--preferred-sampling-params reach chat fields the request leaves unset,
+        ahead of the generation config; a value in the request still wins."""
+        self.tm.preferred_sampling_params = {"top_k": 20, "max_new_tokens": 5}
+        self.tm.model_config.get_default_sampling_params.return_value = {
+            "temperature": 0.6,
+            "top_k": 50,
+        }
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        processed = MessageProcessingResult(
+            "prompt", [1, 2, 3], None, None, [], [], None
+        )
+        user = [{"role": "user", "content": "Hi?"}]
+        cases = (
+            (ChatCompletionRequest(model="x", messages=user), 20),
+            (ChatCompletionRequest(model="x", messages=user, top_k=7), 7),
+        )
+        for req, want_top_k in cases:
+            with patch.object(chat, "_process_messages", return_value=processed):
+                adapted, _ = chat._convert_to_internal_request(req)
+            self.assertEqual(adapted.sampling_params["top_k"], want_top_k)
+            self.assertEqual(adapted.sampling_params["temperature"], 0.6)
+            self.assertIsNone(adapted.sampling_params["max_new_tokens"])
 
     def test_template_tool_call_grammar_covers_skipped_reasoning(self):
         """Output from the message start must open with the reasoning, and calls

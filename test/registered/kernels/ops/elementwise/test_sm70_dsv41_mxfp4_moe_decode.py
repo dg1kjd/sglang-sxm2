@@ -66,7 +66,13 @@ def _quantize_mxfp4_weight(weight: torch.Tensor, group_size: int = 32) -> tuple[
         device=weight.device,
         dtype=torch.float32,
     )
-    mag = (scaled.abs().unsqueeze(-1) - bounds).gt(0).sum(dim=-1).to(torch.uint8)
+    # Same magnitude code as (abs - bounds).gt(0).sum(-1), but per-bound so
+    # the peak stays ~[n, k/32, 32] instead of 7x that (V100 CI hosts have
+    # little GPU headroom).
+    abs_scaled = scaled.abs()
+    mag = (abs_scaled > bounds[0]).to(torch.uint8)
+    for b in bounds[1:]:
+        mag += (abs_scaled > b).to(torch.uint8)
     sign_bit = (scaled < 0).to(torch.uint8) << 3
     codes = (sign_bit | mag).reshape(n, k)
     return _pack_e2m1_codes(codes), scale_u8
@@ -82,26 +88,33 @@ class _DummyMxfp4Moe(torch.nn.Module):
     ):
         super().__init__()
         self.orig_dtype = torch.float16
+        # Quantize on CPU: the fp32 intermediates at DSV4.1 Flash geometry do
+        # not fit a CI host whose GPU is shared with other work. Only the
+        # packed u4 + u8 scales go to the device.
         w13_pack = []
         w13_scale = []
         w2_pack = []
         w2_scale = []
         for _ in range(num_experts):
-            w13 = torch.randn(2 * intermediate_size, hidden_size, device=device) * 0.05
-            w2 = torch.randn(hidden_size, intermediate_size, device=device) * 0.05
+            w13 = torch.randn(2 * intermediate_size, hidden_size) * 0.05
+            w2 = torch.randn(hidden_size, intermediate_size) * 0.05
             p13, s13 = _quantize_mxfp4_weight(w13)
             p2, s2 = _quantize_mxfp4_weight(w2)
             w13_pack.append(p13)
             w13_scale.append(s13)
             w2_pack.append(p2)
             w2_scale.append(s2)
-        self.w13_weight = torch.nn.Parameter(torch.stack(w13_pack).view(torch.int8), False)
-        self.w2_weight = torch.nn.Parameter(torch.stack(w2_pack).view(torch.int8), False)
+        self.w13_weight = torch.nn.Parameter(
+            torch.stack(w13_pack).view(torch.int8).to(device), False
+        )
+        self.w2_weight = torch.nn.Parameter(
+            torch.stack(w2_pack).view(torch.int8).to(device), False
+        )
         self.w13_weight_scale_inv = torch.nn.Parameter(
-            torch.stack(w13_scale).view(torch.float8_e8m0fnu), False
+            torch.stack(w13_scale).view(torch.float8_e8m0fnu).to(device), False
         )
         self.w2_weight_scale_inv = torch.nn.Parameter(
-            torch.stack(w2_scale).view(torch.float8_e8m0fnu), False
+            torch.stack(w2_scale).view(torch.float8_e8m0fnu).to(device), False
         )
 
 
@@ -251,6 +264,76 @@ class TestSm70Dsv41Mxfp4MoeDecode(CustomTestCase):
             f"({marlin_ms / gemv_ms:.2f}x)",
             flush=True,
         )
+
+    def test_small_ue8m0_scales_survive_decode(self):
+        """Issue #6 regression: scale bytes 111/112 must reach the decode GEMV.
+
+        Every fp4 code is +6.0, every w13 group scale is byte 112 (2**-15),
+        every w2 group scale byte 111 (2**-16), x = 1.0. Pre-fix the decode
+        kernel clamped bytes <= 112 to fp16 +0, so gate/up and the expert
+        output were identically zero. The reference dequantizes analytically:
+        each output element is 2304 * silu(5120 * 6 * 2**-15) * 6 * 2**-16.
+        """
+        from sglang.kernels.ops.moe.sm70_dsv41_mxfp4_moe_decode import (
+            sm70_dsv41_mxfp4_moe_decode,
+            sm70_dsv41_mxfp4_moe_decode_eligible,
+        )
+
+        device = torch.device("cuda")
+        hidden = DSV41_FLASH_HIDDEN_SIZE
+        intermediate = DSV41_FLASH_MOE_INTERMEDIATE_SIZE
+        topk = DSV41_FLASH_NUM_EXPERTS_PER_TOK
+        layer = torch.nn.Module()
+        layer.orig_dtype = torch.float16
+        layer.w13_weight = torch.nn.Parameter(
+            torch.full((2, 2 * intermediate, hidden // 2), 0x77,
+                       dtype=torch.uint8, device=device).view(torch.int8),
+            False,
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            torch.full((2, hidden, intermediate // 2), 0x77,
+                       dtype=torch.uint8, device=device).view(torch.int8),
+            False,
+        )
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            torch.full((2, hidden // 32, 2 * intermediate), 112,
+                       dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu),
+            False,
+        )
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            torch.full((2, intermediate // 32, hidden), 111,
+                       dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu),
+            False,
+        )
+        prepare_moe_mxfp4_layer_for_marlin(layer)
+
+        x = torch.ones(1, hidden, dtype=torch.float16, device=device)
+        topk_ids = torch.zeros((1, topk), dtype=torch.int32, device=device)
+        topk_weights = torch.full((1, topk), 1.0 / topk, dtype=torch.float32,
+                                  device=device)
+        self.assertTrue(
+            sm70_dsv41_mxfp4_moe_decode_eligible(
+                x, layer.w13_weight, layer.w2_weight,
+                layer.w13_weight_scale, layer.w2_weight_scale, topk_ids,
+                swiglu_limit=10.0,
+            )
+        )
+        out = sm70_dsv41_mxfp4_moe_decode(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            topk_ids,
+            topk_weights,
+            swiglu_limit=10.0,
+        )
+        gate = torch.tensor(5120.0 * 6.0 * 2.0 ** -15, dtype=torch.float32)
+        act = torch.nn.functional.silu(gate) * gate
+        ref_val = (2304.0 * act * 6.0 * 2.0 ** -16).to(torch.float16)
+        ref = torch.full_like(out, float(ref_val))
+        torch.testing.assert_close(out, ref, rtol=_RTOL, atol=_ATOL)
+        self.assertGreater(float(out.abs().max()), 0.0)
 
     def test_eligible_rejects_prefill_m(self):
         from sglang.kernels.ops.moe.sm70_dsv41_mxfp4_moe_decode import (

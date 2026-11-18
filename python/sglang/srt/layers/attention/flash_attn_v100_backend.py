@@ -177,12 +177,17 @@ class FlashAttnV100Backend(AttentionBackend):
         skip_prefill: bool = False,
     ):
         super().__init__()
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
         self.model_runner = model_runner
         self.device = model_runner.device
         self.page_size = model_runner.page_size
-        if self.page_size != V100_PAGE_SIZE:
+        # Compressed QSA needs page_size 64, and its own backend replaces this
+        # one for the full-attention layers.
+        if self.page_size != V100_PAGE_SIZE and not is_qwen_qsa(
+            model_runner.model_config.hf_config
+        ):
             logger.warning(
                 f"tilelang_fa_v100 expects page_size={V100_PAGE_SIZE}, "
                 f"got page_size={self.page_size}. page_size=1 is supported for "
@@ -279,7 +284,7 @@ class FlashAttnV100Backend(AttentionBackend):
             self._fp8_prefill_scratch_enabled
             and forward_mode.is_extend()
             and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend(include_v2=True)
+            and not forward_mode.is_draft_extend_v2()
         )
 
     def _ensure_fp8_prefill_scratch(
@@ -530,7 +535,7 @@ class FlashAttnV100Backend(AttentionBackend):
                 and not self._uses_fp8_prefill_scratch(mode)
             )
             or mode.is_decode_or_idle()
-            or mode.is_draft_extend(include_v2=True)
+            or mode.is_draft_extend_v2()
             or (mode.is_target_verify() and not self._uses_native_linear_verify(mode))
         ):
             # Decode / spec paths run on the Triton backend.
@@ -617,119 +622,54 @@ class FlashAttnV100Backend(AttentionBackend):
             1, dtype=torch.int32, device=self.device
         )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-    ):
-        if (
-            (
-                self._uses_sm70_fp8_kv
-                and not self._uses_native_linear_verify(forward_mode)
-            )
-            or forward_mode.is_decode_or_idle()
-            or forward_mode.is_draft_extend(include_v2=True)
-            or (
-                forward_mode.is_target_verify()
-                and not self._uses_native_linear_verify(forward_mode)
-            )
-        ):
-            return self._triton.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
-        if self._uses_native_linear_verify(forward_mode):
-            if self._uses_sm70_fp8_kv:
-                self._triton.init_forward_metadata_capture_cuda_graph(
-                    bs,
-                    num_tokens,
-                    req_pool_indices,
-                    seq_lens,
-                    encoder_lens,
-                    forward_mode,
-                    spec_info,
-                )
-            self._set_linear_verify_cuda_graph_metadata(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                int(spec_info.draft_token_num),
-            )
-            return
-        # Extend capture: metadata buffers are filled at replay time.
-        self.forward_metadata = FlashAttnV100ExtendMetadata(
-            page_table=self._cg_page_table[:bs],
-            seq_lens=self._cg_seq_lens[:bs],
-            query_start_loc=self._cg_query_start_loc[: bs + 1],
-            prefix_kv_lens=self._cg_prefix_kv_lens[:bs],
-            causal=True,
-            swa_page_table=(
-                self._cg_swa_page_table[:bs]
-                if self._cg_swa_page_table is not None
-                else None
-            ),
+    def _graph_runs_on_triton(self, mode) -> bool:
+        return (
+            (self._uses_sm70_fp8_kv and not self._uses_native_linear_verify(mode))
+            or mode.is_decode_or_idle()
+            or mode.is_draft_extend_v2()
+            or (mode.is_target_verify() and not self._uses_native_linear_verify(mode))
         )
 
-    def init_forward_metadata_replay_cuda_graph(
+    def init_forward_metadata_out_graph(
         self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-        seq_lens_cpu,
+        forward_batch: "ForwardBatch",
+        in_capture: bool = False,
     ):
-        if (
-            (
-                self._uses_sm70_fp8_kv
-                and not self._uses_native_linear_verify(forward_mode)
+        mode = forward_batch.forward_mode
+        if self._graph_runs_on_triton(mode):
+            self._triton.init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
             )
-            or forward_mode.is_decode_or_idle()
-            or forward_mode.is_draft_extend(include_v2=True)
-            or (
-                forward_mode.is_target_verify()
-                and not self._uses_native_linear_verify(forward_mode)
-            )
-        ):
-            return self._triton.init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
-            )
-        if self._uses_native_linear_verify(forward_mode):
+            self.forward_metadata = None
+            return
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        if self._uses_native_linear_verify(mode):
             if self._uses_sm70_fp8_kv:
-                self._triton.init_forward_metadata_replay_cuda_graph(
-                    bs,
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    encoder_lens,
-                    forward_mode,
-                    spec_info,
-                    seq_lens_cpu,
+                self._triton.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=in_capture
                 )
             self._set_linear_verify_cuda_graph_metadata(
                 bs,
                 req_pool_indices,
                 seq_lens,
-                int(spec_info.draft_token_num),
+                int(forward_batch.spec_info.draft_token_num),
+            )
+            return
+        if in_capture:
+            # Extend capture: metadata buffers are filled at replay time.
+            self.forward_metadata = FlashAttnV100ExtendMetadata(
+                page_table=self._cg_page_table[:bs],
+                seq_lens=self._cg_seq_lens[:bs],
+                query_start_loc=self._cg_query_start_loc[: bs + 1],
+                prefix_kv_lens=self._cg_prefix_kv_lens[:bs],
+                causal=True,
+                swa_page_table=(
+                    self._cg_swa_page_table[:bs]
+                    if self._cg_swa_page_table is not None
+                    else None
+                ),
             )
             return
 
@@ -761,6 +701,10 @@ class FlashAttnV100Backend(AttentionBackend):
         self._cg_query_start_loc.zero_()
         self._cg_query_start_loc[1 : bs + 1] = torch.cumsum(seq_lens_b, dim=0)
         self._cg_prefix_kv_lens[:bs].zero_()
+
+    def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
+        if self._graph_runs_on_triton(forward_batch.forward_mode):
+            self._triton.init_forward_metadata_in_graph(forward_batch)
 
     def _set_linear_verify_cuda_graph_metadata(
         self,
@@ -1047,7 +991,7 @@ class FlashAttnV100Backend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and not self._uses_native_linear_verify(forward_batch.forward_mode)
             )
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             # Tree verification and unsupported FP8 draft masks use Triton's
             # custom-mask path.

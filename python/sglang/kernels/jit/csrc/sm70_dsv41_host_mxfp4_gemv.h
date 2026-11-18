@@ -45,15 +45,18 @@ inline void unpack_fe2m1(uint32_t packed, float out[8]) {
   dequant4(static_cast<int>(packed), out + 4);
 }
 
+/**
+ * \brief UE8M0 byte -> fp32 scale, built directly (``byte << 23`` = 2^(byte-127)).
+ *
+ * Exact for every byte >= 1; matches the device decode kernel. Byte 0 is the
+ * zero-scale padding sentinel and becomes +0, not 2^-127. Bytes 1..112 must
+ * not be zeroed: DeepSeek-V4.1-Flash-1017's draft experts use 111 and 112.
+ */
 inline float e8m0_to_float(uint8_t byte) {
-  int e = static_cast<int>(byte) - 112;
-  if (e <= 0) {
+  if (byte == 0) {
     return 0.f;
   }
-  if (e > 31) {
-    e = 31;
-  }
-  const uint32_t bits = static_cast<uint32_t>(e + 112) << 23;
+  const uint32_t bits = static_cast<uint32_t>(byte) << 23;
   float r;
   std::memcpy(&r, &bits, sizeof(r));
   return r;

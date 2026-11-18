@@ -236,6 +236,16 @@ def normalize_assistant_tool_call_arguments(
                     raise
 
 
+# The fields ChatCompletionRequest.to_sampling_params fills from defaults when unset.
+_REQUEST_DEFAULTED_SAMPLING_FIELDS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+)
+
+
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
     vid_vals = []
@@ -421,16 +431,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     e,
                 )
 
-        # Get default sampling parameters from model's generation config
-        self.default_sampling_params = (
-            self.tokenizer_manager.model_config.get_default_sampling_params()
-        )
+        # Unset request fields take --preferred-sampling-params, then the generation
+        # config; the request fills every unset field from this dict.
+        preferred = self.tokenizer_manager.preferred_sampling_params or {}
+        self.default_sampling_params = {
+            **self.tokenizer_manager.model_config.get_default_sampling_params(),
+            **{
+                name: preferred[name]
+                for name in _REQUEST_DEFAULTED_SAMPLING_FIELDS
+                if name in preferred
+            },
+        }
         if (
             self.default_sampling_params
             and not OpenAIServingChat._default_sampling_params_logged
         ):
             logger.info(
-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+                f"Using default chat sampling params: {self.default_sampling_params}",
             )
             OpenAIServingChat._default_sampling_params_logged = True
 

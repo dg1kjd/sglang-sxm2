@@ -157,6 +157,55 @@ def _extract_system_text(
     return "\n".join(texts) if texts else None
 
 
+def _join_text(message: dict, text: str, *, before: bool) -> None:
+    content = message.get("content")
+    if isinstance(content, list):
+        part = {"type": "text", "text": text}
+        message["content"] = [part, *content] if before else [*content, part]
+    elif content:
+        message["content"] = (
+            f"{text}\n\n{content}" if before else f"{content}\n\n{text}"
+        )
+    else:
+        message["content"] = text
+
+
+def _fold_inline_system_turns(messages: list[dict], inline: set[int]) -> list[dict]:
+    """Fold the system turns at positions ``inline`` into neighbouring messages,
+    for chat templates that accept a system message only at the start."""
+    out: list[dict] = []
+    pending: list[str] = []
+    started = False
+
+    def to_leading(text: str) -> None:
+        if out and out[0]["role"] == "system":
+            out[0]["content"] = f"{out[0]['content']}\n{text}"
+        else:
+            out.insert(0, {"role": "system", "content": text})
+
+    for i, message in enumerate(messages):
+        if i in inline:
+            text = message["content"]
+            if not started:
+                to_leading(text)
+            # Claude Code ends many requests with a system turn and keeps it in
+            # later history; the message before it is the one place that stays
+            # fixed as turns are added, so the cached token prefix stays valid.
+            elif out[-1]["role"] in ("user", "tool"):
+                _join_text(out[-1], text, before=False)
+            else:
+                pending.append(text)
+            continue
+        if pending and message["role"] in ("user", "tool"):
+            _join_text(message, "\n\n".join(pending), before=True)
+            pending = []
+        started = started or message["role"] != "system"
+        out.append(message)
+    for text in pending:
+        to_leading(text)
+    return out
+
+
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
     return f"event: {event_type}\ndata: {data}\n\n"
@@ -519,14 +568,6 @@ class AnthropicServing:
                     if block.type == "text" and block.text:
                         system_parts.append(block.text)
 
-        if self._merge_inline_system:
-            for msg in anthropic_request.messages:
-                if msg.role != "system":
-                    continue
-                text = _extract_system_text(msg.content)
-                if text:
-                    system_parts.append(text)
-
         if system_parts:
             openai_messages.append(
                 {"role": "system", "content": "\n".join(system_parts)}
@@ -549,8 +590,13 @@ class AnthropicServing:
             parts.clear()
 
         # Convert messages
+        inline_system: set[int] = set()
         for msg in anthropic_request.messages:
             if msg.role == "system" and self._merge_inline_system:
+                text = _extract_system_text(msg.content)
+                if text:
+                    inline_system.add(len(openai_messages))
+                    openai_messages.append({"role": "system", "content": text})
                 continue
             if isinstance(msg.content, str):
                 openai_messages.append({"role": msg.role, "content": msg.content})
@@ -660,6 +706,11 @@ class AnthropicServing:
                 # see a valid role-alternation sequence.
                 openai_msg["content"] = ""
                 openai_messages.append(openai_msg)
+
+        if inline_system:
+            openai_messages = _fold_inline_system_turns(
+                messages=openai_messages, inline=inline_system
+            )
 
         # Build ChatCompletionRequest
         request_data = {

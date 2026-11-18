@@ -48,6 +48,7 @@ class MockTokenizerManager:
     def __init__(self, *, is_multimodal: bool = False):
         self.model_config = Mock(is_multimodal=is_multimodal, context_len=4096)
         self.model_config.get_default_sampling_params.return_value = {}
+        self.preferred_sampling_params = None
         self.model_config.hf_config = Mock(
             model_type="llama", architectures=["LlamaForCausalLM"]
         )

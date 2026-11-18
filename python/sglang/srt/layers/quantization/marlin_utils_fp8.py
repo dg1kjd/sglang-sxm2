@@ -251,22 +251,22 @@ def sm70_mxfp8_ue8m0_to_fp16_scales(scales: torch.Tensor) -> torch.Tensor:
     Out-of-range exponents that cannot be represented in FP16 fail loud.
     """
     from sglang.srt.layers.quantization.marlin_utils import (
-        SM70_MXFP4_UE8M0_FP16_EXACT_MAX,
-        SM70_MXFP4_UE8M0_FP16_EXACT_MIN,
+        SM70_MXFP8_UE8M0_FP16_EXACT_MAX,
+        SM70_MXFP8_UE8M0_FP16_EXACT_MIN,
         sm70_mxfp4_ue8m0_to_uint8,
     )
 
     raw = sm70_mxfp4_ue8m0_to_uint8(scales)
     in_range = (raw == 0) | (
-        (raw >= SM70_MXFP4_UE8M0_FP16_EXACT_MIN)
-        & (raw <= SM70_MXFP4_UE8M0_FP16_EXACT_MAX)
+        (raw >= SM70_MXFP8_UE8M0_FP16_EXACT_MIN)
+        & (raw <= SM70_MXFP8_UE8M0_FP16_EXACT_MAX)
     )
     if not bool(in_range.all()):
         bad = raw[~in_range]
         raise RuntimeError(
             "SM70 MXFP8→FP16 scale conversion is exact only for UE8M0 bytes "
-            f"in {{0}} ∪ [{SM70_MXFP4_UE8M0_FP16_EXACT_MIN}, "
-            f"{SM70_MXFP4_UE8M0_FP16_EXACT_MAX}]. "
+            f"in {{0}} ∪ [{SM70_MXFP8_UE8M0_FP16_EXACT_MIN}, "
+            f"{SM70_MXFP8_UE8M0_FP16_EXACT_MAX}]. "
             f"Found {int(bad.min())}..{int(bad.max())}."
         )
     return raw.view(torch.float8_e8m0fnu).to(torch.float16)

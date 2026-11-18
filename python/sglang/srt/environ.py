@@ -451,6 +451,10 @@ class Envs:
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
+    # Directory where TP ranks share compiled xgrammar EBNF and structural-tag
+    # grammars, and where they persist across restarts. Unset: no disk cache.
+    SGLANG_GRAMMAR_DISK_CACHE_DIR = EnvStr(None)
+    SGLANG_GRAMMAR_DISK_CACHE_MAX_ENTRIES = EnvInt(64)
 
     # ===================================================================
     # Fault injection and regression tests

@@ -474,13 +474,23 @@ def sm70_marlin_moe_logical_scales(
 
 
 # SM70 marlin_v100 MXFP4 maps each UE8M0 byte `b` to FP16 as
-#   e = clamp(b - 112, 0, 31); value = 2^(e - 15)
-# which equals the OCP value 2^(b - 127) iff b ∈ [113, 142].
-# Byte 0 (zero-padding) flushes to +0. Hopper BF16 bit-shifts the full
-# E8M0 range (~2^-126 .. 2^127); we refuse out-of-range bytes rather than
-# silently clamp.
-SM70_MXFP4_UE8M0_FP16_EXACT_MIN = 113
+#   e = clamp(b - 112, 0, 31); value = 2^(e - 15)   for b >= 113
+#   1 << (b - 103); value = 2^(b - 127)             for b in [104, 112]
+# Bytes 113..142 equal the OCP value via the normal fp16 mapping; bytes
+# 104..112 are exact fp16 SUBNORMALS (measured exact on Volta: __hmul2 and
+# the HMMA fragments keep subnormals). Byte 103 is refused because the
+# smallest fp4 product, 0.5 * 2^-24 = 2^-25, is not representable in fp16.
+# Byte 0 (zero-padding) is +0. Hopper BF16 bit-shifts the full E8M0 range
+# (~2^-126 .. 2^127); we refuse out-of-range bytes rather than silently
+# clamp.
+SM70_MXFP4_UE8M0_FP16_EXACT_MIN = 104
 SM70_MXFP4_UE8M0_FP16_EXACT_MAX = 142
+
+# MXFP8 carries its group scales as FP16 values (never packed bytes), so the
+# smallest exact byte stays the smallest fp16 normal. The MXFP4 floor above
+# is smaller because the MXFP4 kernels decode packed UE8M0 bytes directly.
+SM70_MXFP8_UE8M0_FP16_EXACT_MIN = 113
+SM70_MXFP8_UE8M0_FP16_EXACT_MAX = 142
 
 # DeepSeek-V4.1-Flash routed-expert geometry. Not V4-Flash.
 DSV41_FLASH_HIDDEN_SIZE = 5120
@@ -528,23 +538,42 @@ def sm70_mxfp4_ue8m0_to_uint8(scales: torch.Tensor) -> torch.Tensor:
     raise TypeError(f"Unsupported MXFP4 UE8M0 scale dtype: {scales.dtype}")
 
 
-def sm70_mxfp4_validate_ue8m0_scales(scales: torch.Tensor) -> None:
-    """Fail loud if any non-padding UE8M0 byte is outside the FP16-exact range."""
+# Smallest byte that decodes to an fp16 normal; bytes below it need the
+# subnormal decode added to marlin_v100 by setup_v100_marlin.sh.
+SM70_MXFP4_UE8M0_FP16_NORMAL_MIN = 113
+
+
+def sm70_mxfp4_validate_ue8m0_scales(scales: torch.Tensor) -> bool:
+    """Fail loud if any non-padding UE8M0 byte is outside the FP16-exact range.
+
+    Returns True when some byte decodes to an fp16 subnormal.
+    """
     raw = sm70_mxfp4_ue8m0_to_uint8(scales)
+    if raw.numel() == 0:
+        return False
+    largest = int(raw.max())
+    # uint8 wraps the padding byte 0 to 255, so this is the smallest nonzero byte.
+    smallest_nonzero = int((raw - 1).min()) + 1
+    if (
+        largest <= SM70_MXFP4_UE8M0_FP16_EXACT_MAX
+        and smallest_nonzero >= SM70_MXFP4_UE8M0_FP16_EXACT_MIN
+    ):
+        return smallest_nonzero < SM70_MXFP4_UE8M0_FP16_NORMAL_MIN
     in_range = (raw == 0) | (
         (raw >= SM70_MXFP4_UE8M0_FP16_EXACT_MIN)
         & (raw <= SM70_MXFP4_UE8M0_FP16_EXACT_MAX)
     )
-    if bool(in_range.all()):
-        return
     bad = raw[~in_range]
     raise RuntimeError(
-        "SM70 marlin_v100 MXFP4 dequantizes UE8M0 in FP16 as "
-        "clamp(byte-112, 0, 31) << 10, which is exact only for bytes in "
-        f"{{0}} ∪ [{SM70_MXFP4_UE8M0_FP16_EXACT_MIN}, "
-        f"{SM70_MXFP4_UE8M0_FP16_EXACT_MAX}] (2^-14 .. 2^15). "
-        f"Found out-of-range bytes {int(bad.min())}..{int(bad.max())}. "
-        "Refusing to clamp (Hopper BF16 Marlin would keep these exponents)."
+        "SM70 marlin_v100 MXFP4 decodes packed UE8M0 bytes to FP16 exactly "
+        "only for bytes in {0} ∪ "
+        f"[{SM70_MXFP4_UE8M0_FP16_EXACT_MIN}, {SM70_MXFP4_UE8M0_FP16_EXACT_MAX}] "
+        f"(2^(byte-127) in 2^-23 .. 2^15; byte 0 is the zero-scale padding "
+        "sentinel). Found out-of-range bytes "
+        f"{int(bad.min())}..{int(bad.max())}. Refusing: below the floor the "
+        "smallest fp4 product 0.5 * scale is under the smallest fp16 "
+        "subnormal 2^-24 and flushes to zero; above the ceiling fp16 "
+        "saturates to inf (Hopper BF16 Marlin keeps these exponents)."
     )
 
 

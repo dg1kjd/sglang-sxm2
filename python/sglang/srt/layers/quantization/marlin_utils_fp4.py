@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 from typing import Callable, Optional
 
 import torch
@@ -599,6 +600,78 @@ def _repack_moe_mxfp4_weight_for_sm70_marlin(
     return packed
 
 
+@lru_cache(maxsize=1)
+def _sm70_marlin_decodes_subnormal_ue8m0() -> bool:
+    """Run one MXFP4 MoE GEMM with scale byte 104 through the installed marlin_v100.
+
+    A library built before the subnormal-scale patch returns zeros here.
+    """
+    from sglang.kernels.ops.moe.moe_align_single_token import (
+        moe_align_single_token,
+    )
+    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.srt.layers.quantization.marlin_utils import (
+        sm70_mxfp4_logical_ue8m0_scales,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    size_n, size_k, block = 256, 256, 8
+    # E2M1 code 2 (1.0) in both nibbles; byte 104 is 2^-23, an fp16 subnormal.
+    weight = torch.full((1, size_n, size_k // 2), 0x22, dtype=torch.uint8)
+    packed = _repack_moe_mxfp4_weight_for_sm70_marlin(
+        weight, num_experts=1, size_n=size_n, size_k=size_k, pack_device=device
+    ).to(device)
+    scales = sm70_mxfp4_logical_ue8m0_scales(
+        torch.full((1, size_n, size_k // 32), 104, dtype=torch.uint8),
+        size_k=size_k,
+        size_n=size_n,
+    ).to(device)
+    x = torch.zeros(1, size_k, dtype=torch.float16, device=device)
+    x[0, 0] = 1.0
+    out = torch.empty(1, size_n, dtype=torch.float16, device=device)
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    topk_weights = torch.ones((1, 1), dtype=torch.float32, device=device)
+    sorted_ids, expert_ids, n_post = moe_align_single_token(topk_ids, block)
+    moe_wna16_marlin_gemm(
+        x,
+        out,
+        packed,
+        None,
+        scales,
+        None,
+        None,
+        None,
+        None,
+        marlin_make_workspace(device, 4),
+        sorted_ids,
+        expert_ids,
+        n_post,
+        topk_weights,
+        moe_block_size=block,
+        top_k=1,
+        mul_topk_weights=False,
+        is_ep=False,
+        b_q_type=scalar_types.float4_e2m1f,
+        size_m=1,
+        size_n=size_n,
+        size_k=size_k,
+        is_k_full=True,
+        use_atomic_add=False,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+    return bool((out == 2.0**-23).all())
+
+
+def _require_sm70_marlin_subnormal_ue8m0() -> None:
+    if not _sm70_marlin_decodes_subnormal_ue8m0():
+        raise RuntimeError(
+            "This MXFP4 checkpoint has UE8M0 scale bytes 104..112, and the "
+            "installed marlin_v100 library decodes them to zero. Rebuild it "
+            "with scripts/setup_v100_marlin.sh."
+        )
+
+
 def _prepare_moe_mxfp4_layer_for_sm70_marlin(layer: torch.nn.Module) -> None:
     """MXFP4 e2m1 + UE8M0 g32 → marlin_v100 W4A16 (logical E8M0 scales).
 
@@ -759,8 +832,10 @@ def _prepare_moe_mxfp4_layer_for_sm70_marlin(layer: torch.nn.Module) -> None:
         sm70_mxfp4_ue8m0_to_uint8(w2_scale_cpu), packing=group_size
     )
     del w13_scale_cpu, w2_scale_cpu
-    sm70_mxfp4_validate_ue8m0_scales(w13_scale_u8)
-    sm70_mxfp4_validate_ue8m0_scales(w2_scale_u8)
+    w13_subnormal = sm70_mxfp4_validate_ue8m0_scales(w13_scale_u8)
+    w2_subnormal = sm70_mxfp4_validate_ue8m0_scales(w2_scale_u8)
+    if w13_subnormal or w2_subnormal:
+        _require_sm70_marlin_subnormal_ue8m0()
     if w13_bias_cpu is not None:
         w13_bias_cpu = _pad_w13(w13_bias_cpu.unsqueeze(-1)).squeeze(-1)
 

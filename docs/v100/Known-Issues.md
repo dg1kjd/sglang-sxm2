@@ -85,9 +85,8 @@ repeated it about 500 times. Then it switched to ∀ ("for all") and repeated th
 - **What the model's authors suggest.** Their inference code defaults to temperature 0.7 and
   top_p 0.9, and transformers then applies top_k 50. Their documentation suggests
   `--top-k 20 --repetition-penalty 1.05`.
-- **Current server default.** `scripts/serve_sensenova_loop_v100.sh` does not set a top_k. A
-  request without one gets the model's `generation_config.json` values: temperature 1.0, top_p
-  0.95, no top_k.
+- **Current server default.** `scripts/serve_sensenova_loop_v100.sh` sets top_k 20 for requests
+  that set none (`SENSENOVA_TOP_K`, -1 turns it off). A request's own `top_k` wins.
 - **Limits of this workaround.**
   - Its effect on answer accuracy has not been measured.
   - It stops the first stray pick. It does not break a repeat that has already started: under the

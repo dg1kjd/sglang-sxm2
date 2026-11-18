@@ -83,6 +83,11 @@ fi
 # group of video frames (glm5_next.py); what stays on the GPU is ~20 MB per rank.
 # The checkpoint's processor ships with transformers 5.19.
 GLM53_VISION="${GLM53_VISION:-1}"
+# A request with tools compiles GLM's tool-call grammar (~10 CPU-seconds) on every
+# TP rank; with a shared directory one rank compiles and the others load it, and a
+# tool set seen before loads from disk after a restart. Set it empty to turn it off.
+export SGLANG_GRAMMAR_DISK_CACHE_DIR="${SGLANG_GRAMMAR_DISK_CACHE_DIR-$HOME/.cache/sglang/grammar}"
+
 VISION_ARGS=()
 # The embedding cache keeps an image that spans several prefill chunks from
 # being encoded again for each chunk. In host memory it costs no KV pool

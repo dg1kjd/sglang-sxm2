@@ -84,6 +84,7 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         tm.tokenizer, tm.processor = _tokenizer(), None
         # V100 port: the chat handler reads the prompt segment encoder.
         tm.segment_encoder = None
+        tm.preferred_sampling_params = None
         tm.model_config = Mock(is_multimodal=multimodal, context_len=4096)
         tm.model_config.get_default_sampling_params.return_value = {}
         tm.model_config.hf_config = Mock(architectures=["LlamaForCausalLM"])

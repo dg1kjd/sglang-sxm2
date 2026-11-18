@@ -19,10 +19,11 @@ SXM2 (NVLink) is only needed for speed. Any set of 32 GB V100s works, PCIe cards
 |---|---|---|---|
 | **[GLM-5.3-Flash](docs/v100/GLM-5.3-Flash.md)**, 320B MoE, NVFP4, MTP | 8× V100 32 GB | 240k | **Agentic coding.** The primary model, with image and video input |
 | **[Qwen3.8-Flash-Next](docs/v100/Qwen3.8-Flash-Next.md)**, 125B MoE, NVFP4, MTP | 4× V100 32 GB | 262k | Coding and chat on four cards, image input, up to 3 parallel requests |
-| **[DeepSeek-V4.1-Flash](docs/v100/DeepSeek-V4.1-Flash.md)**, official MXFP8 + MXFP4, DSpark | 8× V100 32 GB, ~300 GiB host RAM | 256k | **Best reasoning and world knowledge** of the four. The full official checkpoint, for agentic coding where answer quality matters more than speed |
+| **[DeepSeek-V4.1-Flash](docs/v100/DeepSeek-V4.1-Flash.md)**, official MXFP8 + MXFP4, DSpark | 8× V100 32 GB, ~300 GiB host RAM | 256k | **Best reasoning and world knowledge** here. The full official checkpoint, for agentic coding where answer quality matters more than speed |
 | **[MiniMax-H3](docs/v100/MiniMax-H3.md)**, video + audio | 4× V100 32 GB | 4–15 s clips | Text-to-video, keyframes, reference image/video/audio |
+| **[SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B)**, 9B looped, fp16 *(experimental)* | 4× V100 32 GB | 262k | Experimental. A small model with image input, up to 6 parallel requests. See [its section](#sensenova-loop-9b-experimental) |
 
-Each model page has the full measurements, the exact launch recipe, and why each flag has its value. Other models may load, but they are untested here.
+Each model page has the full measurements, the exact launch recipe, and why each flag has its value. SenseNova-Loop-9B has no page; its section below is all there is. Other models may load, but they are untested here.
 
 **Which one fits?**
 - **8 cards:** GLM-5.3-Flash for fast turns, with images and video. DeepSeek-V4.1-Flash for the hardest problems, if the host has the RAM.
@@ -68,6 +69,16 @@ It is slow: about 11 tok/s on short code, about 7 on prose. The resident convers
 
 On 4 GPUs, a 5 s 960×544 clip takes 50 steps of 10–12 s each. A 5 s 1344×768 clip takes about 25 minutes.
 
+### SenseNova-Loop-9B (experimental)
+
+A 9B model that runs layers 4–27 twice for each token. It runs in fp16 on 4 GPUs, without MTP.
+
+- **Decode:** ~65 tok/s for one stream. Up to six requests run at once. The KV pool holds 854k tokens, so about three of them can be at the full 262k context.
+- **Turns:** a short tool-call turn answers in ~0.11 s. With a 245k conversation cached, a short follow-up question takes ~4.6 s; the cold 245k prompt takes 131 s.
+- **Images:** a 3840×2160 image (8,202 tokens) takes ~4 s.
+- **Sampling:** without a top-k cut the model can draw a very unlikely token and then repeat it until `max_tokens` ([Known issues](docs/v100/Known-Issues.md)). The serve script therefore sets top_k 20 for requests that set none. A request's own `top_k` wins.
+- **Thinking** is on by default. Turn it off with `"chat_template_kwargs": {"enable_thinking": false}` (OpenAI) or `"thinking": {"type": "disabled"}` (Anthropic). There are no effort levels.
+
 ### What makes the turns fast
 
 - **Prefix cache:** a turn that extends a cached conversation prefills only the new tokens.
@@ -78,8 +89,8 @@ On 4 GPUs, a 5 s 960×544 clip takes 50 steps of 10–12 s each. A 5 s 1344×768
 ## Requirements
 
 - **GPUs:** V100 with **32 GB**. SXM2 with NVLink is the measured setup. PCIe V100s run the same scripts, slower; GLM and Qwen need the interconnect switches under "PCIe V100s" on their pages.
-- **Host RAM:** GLM ~23 GB, up to ~29 GB with images. Qwen ~134 GB with the host KV tier, so plan for 160 GB. DeepSeek ~300 GiB (Engram on 1 GiB hugepages plus pinned expert spill). Each model page has the breakdown.
-- **Disk:** GLM 190 GB, Qwen 126 GB, DeepSeek 476 GB, plus the H3 checkpoint.
+- **Host RAM:** GLM ~23 GB, up to ~29 GB with images. Qwen ~134 GB with the host KV tier, so plan for 160 GB. DeepSeek ~300 GiB (Engram on 1 GiB hugepages plus pinned expert spill). Each model page has the breakdown. SenseNova ~15 GB.
+- **Disk:** GLM 190 GB, Qwen 126 GB, DeepSeek 476 GB, SenseNova 18 GB, plus the H3 checkpoint.
 - **CUDA 12.8 or 12.9.** CUDA 13 dropped Volta.
 - **GCC ≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, which many distros now default to.
 - **Python 3.12**, Linux. `ffmpeg` and `ffprobe` for MiniMax-H3.
@@ -114,7 +125,7 @@ Checkpoints are read from `MODELS_DIR` (default `~/models`) under the directory 
 
 ## Run
 
-One language model at a time. All three bind `0.0.0.0:11435` (`SGLANG_V100_HOST`, `SGLANG_V100_PORT`). The first launch compiles JIT kernels for several minutes.
+One language model at a time. All four bind `0.0.0.0:11435` (`SGLANG_V100_HOST`, `SGLANG_V100_PORT`). The first launch compiles JIT kernels for several minutes.
 
 ```bash
 pip install -U "huggingface_hub[cli]"
@@ -134,6 +145,11 @@ MODEL_PATH=~/models/DeepSeek-V4.1-Flash bash scripts/serve_dsv41_v100.sh
 # MiniMax-H3 video, 4 GPUs, port 30010
 hf download MiniMaxAI/MiniMax-H3 --local-dir ~/models/MiniMax-H3
 H3_MODEL=~/models/MiniMax-H3 bash scripts/serve_minimax_h3_v100.sh
+
+# SenseNova-Loop-9B (experimental), 4 GPUs. The repository is gated: accept its
+# terms on its Hugging Face page and run `hf auth login` first.
+hf download sensenova/SenseNova-Loop-9B --local-dir ~/models/SenseNova-Loop-9B
+SENSENOVA_MODEL=~/models/SenseNova-Loop-9B bash scripts/serve_sensenova_loop_v100.sh
 ```
 
 The server is ready when the log says `The server is fired up and ready to roll!`.
@@ -166,6 +182,7 @@ These models reason before they answer. An empty `content` with a large `complet
 - **DeepSeek-V4.1-Flash keeps one conversation resident** (the last four on disk). A new conversation prefills from scratch, and a long uncached suffix runs at about 300 tok/s.
 - **GLM: the first tool turn after a cold 190k prompt takes ~1.15 s** (the next ones 0.64–0.70 s). Not found yet.
 - **Not soaked for days.** DeepSeek carried a multi-hour Claude Code session and Qwen an hour of mixed load. GLM has no multi-hour soak yet.
+- **SenseNova-Loop-9B is experimental.** It passed short checks (gsm8k, a 245k needle, tool calls, images, thinking on and off) but has not carried a long session.
 - **Volta has no bf16 and no FP4/FP8 hardware.** Everything runs as fp16 with weight-only 4/8-bit kernels, so numerics differ slightly from a Hopper run of the same checkpoint.
 
 ## Relationship to SGLang

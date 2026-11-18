@@ -133,7 +133,59 @@ class TestSm70Mxfp4MarlinPack(CustomTestCase):
         scales = torch.tensor([[[100]]], dtype=torch.uint8)
         with self.assertRaises(RuntimeError) as ctx:
             sm70_mxfp4_validate_ue8m0_scales(scales)
-        self.assertIn("Refusing to clamp", str(ctx.exception))
+        self.assertIn("out-of-range bytes 100..100", str(ctx.exception))
+        self.assertIn("Refusing", str(ctx.exception))
+
+    def test_small_ue8m0_bytes_104_to_112_accepted(self):
+        # Issue #6: the DeepSeek-V4.1-Flash-1017 draft carries routed-expert
+        # scale bytes 111/112 (2^-16 / 2^-15). The loader must accept every
+        # byte whose value 2**(b-127) is fp16-exact, not just fp16 normals.
+        # The return value says whether the marlin_v100 library must be
+        # probed for the subnormal decode; padding byte 0 must not count.
+        for byte in [0, 104, 105, 110, 111, 112, 113, 127, 134, 142]:
+            with self.subTest(byte=byte):
+                scales = torch.full((1, 4, 4), byte, dtype=torch.uint8)
+                subnormal = sm70_mxfp4_validate_ue8m0_scales(scales)
+                self.assertEqual(subnormal, 104 <= byte <= 112)
+        mixed = torch.tensor([[[0, 113, 142, 0]]], dtype=torch.uint8)
+        self.assertFalse(sm70_mxfp4_validate_ue8m0_scales(mixed))
+        mixed[0, 0, 3] = 112
+        self.assertTrue(sm70_mxfp4_validate_ue8m0_scales(mixed))
+
+    def test_ue8m0_byte_103_refused_as_below_fp16_subnormal_floor(self):
+        scales = torch.tensor([[[103]]], dtype=torch.uint8)
+        with self.assertRaises(RuntimeError) as ctx:
+            sm70_mxfp4_validate_ue8m0_scales(scales)
+        self.assertIn("out-of-range bytes 103..103", str(ctx.exception))
+        # Why 103 is the floor: 0.5 * 2**(103-127) = 2**-25 flushes to zero in
+        # fp16, while byte 104's smallest product is exactly the smallest fp16
+        # subnormal 2**-24.
+        self.assertEqual(torch.tensor(2.0 ** -25, dtype=torch.float16).item(), 0.0)
+        self.assertEqual(torch.tensor(2.0 ** -24, dtype=torch.float16).item(), 2.0 ** -24)
+
+    def test_accepted_ue8m0_fp16_products_are_bitwise_exact(self):
+        # Every accepted byte maps to fp16 as 2**(b-127) (subnormal bits
+        # 1 << (b-103) for 104..112), and every e2m1 magnitude times that
+        # scale is exactly representable in fp16 -- so the kernel's fp16
+        # scale multiply loses no bits for the accepted range.
+        for byte in range(104, 143):
+            with self.subTest(byte=byte):
+                scale_f32 = 2.0 ** (byte - 127)
+                scale_f16 = torch.tensor(scale_f32, dtype=torch.float16)
+                bits = int(scale_f16.view(torch.int16).item())
+                if byte <= 112:
+                    self.assertEqual(bits, 1 << (byte - 103))
+                else:
+                    self.assertEqual(bits, (byte - 112) << 10)
+                for mag in _E2M1:
+                    for v in (mag, -mag):
+                        prod_f32 = v * scale_f32
+                        expected = torch.tensor(prod_f32, dtype=torch.float16)
+                        got = torch.tensor(v, dtype=torch.float16) * scale_f16
+                        self.assertEqual(
+                            int(expected.view(torch.int16).item()),
+                            int(got.view(torch.int16).item()),
+                        )
 
     def test_nvfp4_e4m3_scales_fail_loud(self):
         scales = torch.zeros((2, 4, 4), dtype=torch.float8_e4m3fn)

@@ -58,6 +58,7 @@ class _MockTokenizerManager:
         self.model_path = self.server_args.model_path
         self.served_model_name = SERVED_MODEL_NAME
         self.model_config = Mock(is_multimodal=False)
+        self.preferred_sampling_params = None
         self.model_config.get_default_sampling_params.return_value = {}
         self.model_config.hf_config = Mock(
             model_type="llama", architectures=["LlamaForCausalLM"]

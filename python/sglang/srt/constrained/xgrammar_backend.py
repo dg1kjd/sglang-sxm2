@@ -37,11 +37,13 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
 )
+from sglang.srt.constrained.grammar_disk_cache import GrammarDiskCache
 from sglang.srt.constrained.json_schema_validation import (
     UnsupportedJSONSchemaFeature,
     validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.device import is_pin_memory_available
 
@@ -244,6 +246,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
         self._tokenizer_info = tokenizer_info
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        self._disk_cache = None
+        if envs.SGLANG_GRAMMAR_DISK_CACHE_DIR.get():
+            self._disk_cache = GrammarDiskCache(
+                envs.SGLANG_GRAMMAR_DISK_CACHE_DIR.get(),
+                tokenizer_info,
+                envs.SGLANG_GRAMMAR_DISK_CACHE_MAX_ENTRIES.get(),
+            )
         self._framing_compiler = self._new_framing_compiler(tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
@@ -407,9 +416,20 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
+    def _compile_shared(
+        self, kind: str, key: str, compile_fn: Callable[[], CompiledGrammar]
+    ) -> CompiledGrammar:
+        if self._disk_cache is None:
+            return compile_fn()
+        return self._disk_cache.get_or_compile(kind, key, compile_fn)
+
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         try:
-            ctx = self.grammar_compiler.compile_grammar(key_string)
+            ctx = self._compile_shared(
+                "ebnf",
+                key_string,
+                lambda: self.grammar_compiler.compile_grammar(key_string),
+            )
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
@@ -441,14 +461,22 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     tags, structural_tag["triggers"]
                 )
                 new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
-                ctx = self.grammar_compiler.compile_structural_tag(new_tag)
+                ctx = self._compile_shared(
+                    "legacy_structural_tag",
+                    key_string,
+                    lambda: self.grammar_compiler.compile_structural_tag(new_tag),
+                )
             else:
                 format_dict = structural_tag.get("format")
                 if isinstance(format_dict, dict):
                     self._sanitize_structural_format(format_dict)
                     structural_tag["format"] = format_dict
                     key_string = json.dumps(structural_tag)
-                ctx = self.grammar_compiler.compile_structural_tag(key_string)
+                ctx = self._compile_shared(
+                    "structural_tag",
+                    key_string,
+                    lambda: self.grammar_compiler.compile_structural_tag(key_string),
+                )
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))

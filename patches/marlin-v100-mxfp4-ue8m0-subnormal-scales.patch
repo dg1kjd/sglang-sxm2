@@ -1,0 +1,61 @@
+diff --git a/csrc/moe/marlin_moe_wna16/sm70_marlin_mxfp4_gemm.cu b/csrc/moe/marlin_moe_wna16/sm70_marlin_mxfp4_gemm.cu
+index 3cbddd1..d2acb32 100644
+--- a/csrc/moe/marlin_moe_wna16/sm70_marlin_mxfp4_gemm.cu
++++ b/csrc/moe/marlin_moe_wna16/sm70_marlin_mxfp4_gemm.cu
+@@ -28,17 +28,14 @@ constexpr int kMxfp4ValuesPerWord = 8;
+ 
+ CUTLASS_DEVICE
+ __half2 e8m0x2_to_half2_fast(uint16_t e8m0_x2) {
+-  int v0 = e8m0_x2 & 0xFF;
+-  int v1 = e8m0_x2 >> 8;
+-
+-  int e0 = v0 - 112;
+-  e0 = e0 < 0 ? 0 : (e0 > 31 ? 31 : e0);
+-
+-  int e1 = v1 - 112;
+-  e1 = e1 < 0 ? 0 : (e1 > 31 ? 31 : e1);
+-
+-  uint32_t res = ((e1 << 10) << 16) | (e0 << 10);
+-  return *reinterpret_cast<__half2*>(&res);
++  // A UE8M0 byte b is the exponent field of the fp32 2^(b - 127); byte 0 is
++  // the padding sentinel and gives +0. Rounding to fp16 keeps 2^-24..2^15
++  // exact, fp16 subnormals (bytes 103..112) included; Volta HMMA and __hmul2
++  // keep subnormal operands exact. Lower bytes become +0, bytes from 143 +inf.
++  // Keep this branchless: per-byte branches here slow the MoE GEMM about 2x.
++  const float lo = __uint_as_float(static_cast<uint32_t>(e8m0_x2 & 0xFF) << 23);
++  const float hi = __uint_as_float(static_cast<uint32_t>(e8m0_x2 >> 8) << 23);
++  return __floats2half2_rn(lo, hi);
+ }
+ 
+ CUTLASS_DEVICE
+diff --git a/csrc/quantization/marlin/sm70_marlin_mxfp4_gemm.cu b/csrc/quantization/marlin/sm70_marlin_mxfp4_gemm.cu
+index 87f3f1a..c886767 100644
+--- a/csrc/quantization/marlin/sm70_marlin_mxfp4_gemm.cu
++++ b/csrc/quantization/marlin/sm70_marlin_mxfp4_gemm.cu
+@@ -45,18 +45,14 @@ constexpr int kMxfp4ValuesPerWord = 8;
+ 
+ CUTLASS_DEVICE
+ __half2 e8m0x2_to_half2_fast(uint16_t e8m0_x2) {
+-  int v0 = e8m0_x2 & 0xFF;
+-  int v1 = e8m0_x2 >> 8;
+-
+-  int e0 = v0 - 112;
+-  e0 = e0 < 0 ? 0 : (e0 > 31 ? 31 : e0);
+-
+-  int e1 = v1 - 112;
+-  e1 = e1 < 0 ? 0 : (e1 > 31 ? 31 : e1);
+-
+-  uint32_t res = ((e1 << 10) << 16) | (e0 << 10);
+-
+-  return *reinterpret_cast<__half2*>(&res);
++  // A UE8M0 byte b is the exponent field of the fp32 2^(b - 127); byte 0 is
++  // the padding sentinel and gives +0. Rounding to fp16 keeps 2^-24..2^15
++  // exact, fp16 subnormals (bytes 103..112) included; Volta HMMA and __hmul2
++  // keep subnormal operands exact. Lower bytes become +0, bytes from 143 +inf.
++  // Keep this branchless: per-byte branches here slow the MoE GEMM about 2x.
++  const float lo = __uint_as_float(static_cast<uint32_t>(e8m0_x2 & 0xFF) << 23);
++  const float hi = __uint_as_float(static_cast<uint32_t>(e8m0_x2 >> 8) << 23);
++  return __floats2half2_rn(lo, hi);
+ }
+ 
+ CUTLASS_DEVICE

@@ -46,6 +46,7 @@ PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/patches"
 SM70_PATCHES=(
   "$PATCH_DIR/marlin-v100-qwen-sm70-tuning.patch"
   "$PATCH_DIR/marlin-v100-qwen38-nvfp4-tuning.patch"
+  "$PATCH_DIR/marlin-v100-mxfp4-ue8m0-subnormal-scales.patch"
 )
 # CUDA 12.8+ <cuda_bf16.hpp> defines the bf16x2 intrinsics on every arch, so the
 # compat shim would redefine them. Default: apply it only below 12.8 (the torch
@@ -132,12 +133,13 @@ export PATH="$CUDA_HOME/bin:$PATH"
 log "CUDA_HOME=$CUDA_HOME  nvcc=$(nvcc --version | tail -1 | awk '{print $2}')"
 
 # gcc-13 hits the well-known _Float128 / glibc error in CUDA's <mathcalls.h>;
-# gcc-12 is the known-good host compiler for sm70 on this toolchain.
+# gcc-12 is the known-good host compiler for sm70 on this toolchain. CUDA 12.9
+# also builds these kernels with gcc-14 (the newest host compiler it accepts).
 if [[ -z "${CUDAHOSTCXX:-}" ]]; then
-  for cand in /usr/bin/g++-12 /usr/bin/g++-11 /usr/bin/g++-10; do
+  for cand in /usr/bin/g++-12 /usr/bin/g++-11 /usr/bin/g++-10 /usr/bin/g++-14; do
     [[ -x "$cand" ]] && CUDAHOSTCXX="$cand" && break
   done
-  [[ -n "${CUDAHOSTCXX:-}" ]] || die "no g++-12/11/10 found; install g++-12 or set CUDAHOSTCXX."
+  [[ -n "${CUDAHOSTCXX:-}" ]] || die "no g++-12/11/10/14 found; install g++-12 or set CUDAHOSTCXX."
 fi
 export CUDAHOSTCXX
 log "CUDAHOSTCXX=$CUDAHOSTCXX"

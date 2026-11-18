@@ -73,15 +73,19 @@ SGL_DEVICE void dequant_fe2m1_word(uint32_t packed, half2 frag[4]) {
 }
 
 /**
- * \brief SM70 UE8M0 -> float, matching marlin_v100 ``e8m0x2_to_half2_fast``.
+ * \brief SM70 UE8M0 -> float, built directly in fp32.
  *
- * Exact iff byte in {0} union [113, 142]. Byte 0 becomes +0, not 2^-127.
+ * Exact for every byte >= 1 (bit pattern ``byte << 23`` = 2^(byte - 127));
+ * the load-time validation keeps bytes in {0} u [104, 142]. Byte 0 is the
+ * zero-scale padding sentinel and becomes +0, not 2^-127. Scales are
+ * consumed in fp32 below (``w * scale`` then ``fmaf``), so there is no fp16
+ * round-trip to preserve.
  */
 SGL_DEVICE float e8m0_to_float(uint8_t byte) {
-  int e = static_cast<int>(byte) - 112;
-  e = e < 0 ? 0 : (e > 31 ? 31 : e);
-  const uint16_t bits = static_cast<uint16_t>(e << 10);
-  return __half2float(*reinterpret_cast<const __half*>(&bits));
+  if (byte == 0) {
+    return 0.f;
+  }
+  return __uint_as_float(static_cast<uint32_t>(byte) << 23);
 }
 
 SGL_DEVICE void load_e8m0_scales(const uint8_t* __restrict__ scale_row, int32_t n_base, float out[8]) {

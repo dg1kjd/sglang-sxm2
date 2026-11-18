@@ -401,6 +401,7 @@ class TestDsv41Handler(CustomTestCase):
             server_args=args,
             tokenizer=_CharTokenizer(),
             segment_encoder=None,
+            preferred_sampling_params=None,
             model_config=SimpleNamespace(
                 is_multimodal=True,
                 context_len=131072,

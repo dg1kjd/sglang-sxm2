@@ -1702,52 +1702,87 @@ class TestAnthropicServing(unittest.TestCase):
         # strict role-alternation chat templates (qwen, llama, mistral).
         self.assertEqual(roles, ["user", "assistant", "user"])
 
-    def test_in_messages_system_merged_when_template_requires_first(self):
+    def test_in_messages_system_folded_when_template_requires_first(self):
         """When the chat template rejects mid-conversation ``role: "system"``
         (e.g. Qwen's system-first guard), the converter folds the inline
-        system turn into the leading system block so the template doesn't
-        400. The request object itself is no longer mutated — detection runs
-        in the serving layer on conversion."""
-        serving = self._serving()
-        request = self._anthropic_request(
-            stream=False,
-            messages=[
-                {"role": "user", "content": "hi"},
-                {"role": "system", "content": "Reply with exactly: OK"},
-                {"role": "user", "content": "go"},
-            ],
-        )
-        self.assertIsNone(request.system)
-        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
-        chat_request = serving._convert_to_chat_completion_request(request)
-        self.assertEqual(
-            [m.role for m in chat_request.messages], ["system", "user", "user"]
-        )
-        self.assertEqual(chat_request.messages[0].content, "Reply with exactly: OK")
-
-    def test_in_messages_system_merged_with_top_level_when_merge(self):
-        """On the merge path, a top-level ``system`` field and a mid-conversation
-        system turn are joined into the leading system block; top-level text
-        comes first."""
+        system turn into the user message before it so the template doesn't
+        400. The request object itself is not mutated."""
         serving = self._serving()
         request = self._anthropic_request(
             stream=False,
             system="You are terse.",
             messages=[
                 {"role": "user", "content": "hi"},
-                {"role": "system", "content": "One word only."},
+                {"role": "system", "content": "Reply with exactly: OK"},
                 {"role": "user", "content": "go"},
             ],
         )
-        self.assertEqual(request.system, "You are terse.")
         self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
         chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(
             [m.role for m in chat_request.messages], ["system", "user", "user"]
         )
+        self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertEqual(
-            chat_request.messages[0].content, "You are terse.\nOne word only."
+            chat_request.messages[1].content, "hi\n\nReply with exactly: OK"
         )
+
+    def test_merge_path_keeps_previous_turn_as_prefix(self):
+        """Claude Code ends requests with a system turn and keeps the earlier
+        ones in history. On the merge path, one turn's converted messages must
+        stay a prefix of the next turn's; gathering the system turns into the
+        leading block rewrote it on every turn and the prefix cache missed."""
+        serving = self._serving()
+
+        def tool_round(n):
+            return [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": f"t{n}", "name": "Bash", "input": {}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": f"t{n}", "content": "x"}
+                    ],
+                },
+                {"role": "system", "content": f"<total_tokens>{n}</total_tokens>"},
+            ]
+
+        def convert(messages):
+            request = self._anthropic_request(
+                stream=False, system="You are terse.", messages=messages
+            )
+            chat_request = serving._convert_to_chat_completion_request(request)
+            return [m.model_dump(exclude_none=True) for m in chat_request.messages]
+
+        first = [{"role": "user", "content": "go"}, *tool_round(1)]
+        before, after = convert(first), convert([*first, *tool_round(2)])
+        self.assertEqual(after[: len(before)], before)
+        self.assertEqual(before[0]["content"], "You are terse.")
+        self.assertEqual(before[-1]["role"], "tool")
+        self.assertIn("<total_tokens>1</total_tokens>", before[-1]["content"])
+
+    def test_in_messages_system_after_assistant_joins_next_user(self):
+        """A system turn that follows an assistant message has no user or tool
+        message before it, so it opens the next user message instead."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "system", "content": "One word only."},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages], ["user", "assistant", "user"]
+        )
+        self.assertEqual(chat_request.messages[2].content, "One word only.\n\ngo")
 
     def test_in_messages_system_passed_through_when_template_allows_inline(self):
         """When the chat template renders ``role: "system"`` at any position
@@ -1854,7 +1889,7 @@ class TestAnthropicServing(unittest.TestCase):
     def test_constructed_message_objects_merged_on_merge_path(self):
         """Requests built programmatically with ``AnthropicMessage`` objects
         (e.g. ``handle_count_tokens``) also get inline system folded into the
-        leading block on the merge path."""
+        message before it on the merge path."""
         serving = self._serving()
         request = AnthropicMessagesRequest(
             model="m",
@@ -1867,10 +1902,8 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
         chat_request = serving._convert_to_chat_completion_request(request)
-        self.assertEqual(
-            [m.role for m in chat_request.messages], ["system", "user", "user"]
-        )
-        self.assertEqual(chat_request.messages[0].content, "be terse")
+        self.assertEqual([m.role for m in chat_request.messages], ["user", "user"])
+        self.assertEqual(chat_request.messages[0].content, "hi\n\nbe terse")
 
     def test_thinking_history_drop_on_missing_detector(self):
         """Replaying a thinking block on a non-reasoning model should not 400."""

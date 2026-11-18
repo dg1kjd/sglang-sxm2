@@ -82,16 +82,17 @@ def _quantize_mxfp4_weight(weight: torch.Tensor, group_size: int = 32) -> tuple[
         device=weight.device,
         dtype=torch.float32,
     )
-    mag = (scaled.abs().unsqueeze(-1) - bounds).gt(0).sum(dim=-1).to(torch.uint8)
+    # Same magnitude code as (abs - bounds).gt(0).sum(-1), but per-bound so
+    # the peak stays ~[n, k/32, 32] instead of 7x that (V100 CI hosts have
+    # little GPU headroom).
+    abs_scaled = scaled.abs()
+    mag = (abs_scaled > bounds[0]).to(torch.uint8)
+    for b in bounds[1:]:
+        mag += (abs_scaled > b).to(torch.uint8)
     sign_bit = (scaled < 0).to(torch.uint8) << 3
     codes = (sign_bit | mag).reshape(n, k)
     packed = _pack_e2m1_codes(codes)
     return packed, scale_u8
-
-
-def _random_mxfp4_linear(n: int, k: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    weight = torch.randn(n, k, device=device, dtype=torch.float32) * 0.05
-    return _quantize_mxfp4_weight(weight)
 
 
 class _DummyMxfp4Moe(torch.nn.Module):
@@ -104,6 +105,10 @@ class _DummyMxfp4Moe(torch.nn.Module):
     ):
         super().__init__()
         self.orig_dtype = torch.float16
+        # Quantize and dequantize on CPU: the fp32 intermediates at DSV4.1
+        # Flash geometry (~700 MB peak on GPU) do not fit a CI host whose GPU
+        # is shared with other work. Only the packed u4 + u8 scales go to the
+        # device; the fp32 reference stays on CPU and is moved per call.
         w13_pack = []
         w13_scale = []
         w2_pack = []
@@ -111,25 +116,27 @@ class _DummyMxfp4Moe(torch.nn.Module):
         self._w13_fp32 = []
         self._w2_fp32 = []
         for _ in range(num_experts):
-            w13, s13 = _random_mxfp4_linear(2 * intermediate_size, hidden_size, device)
-            w2, s2 = _random_mxfp4_linear(hidden_size, intermediate_size, device)
-            w13_pack.append(w13)
+            w13 = torch.randn(2 * intermediate_size, hidden_size) * 0.05
+            w2 = torch.randn(hidden_size, intermediate_size) * 0.05
+            p13, s13 = _quantize_mxfp4_weight(w13)
+            p2, s2 = _quantize_mxfp4_weight(w2)
+            w13_pack.append(p13)
             w13_scale.append(s13)
-            w2_pack.append(w2)
+            w2_pack.append(p2)
             w2_scale.append(s2)
-            self._w13_fp32.append(dequant_mxfp4_e2m1_ue8m0(w13, s13))
-            self._w2_fp32.append(dequant_mxfp4_e2m1_ue8m0(w2, s2))
+            self._w13_fp32.append(dequant_mxfp4_e2m1_ue8m0(p13, s13))
+            self._w2_fp32.append(dequant_mxfp4_e2m1_ue8m0(p2, s2))
         self.w13_weight = torch.nn.Parameter(
-            torch.stack(w13_pack).view(torch.int8), False
+            torch.stack(w13_pack).view(torch.int8).to(device), False
         )
         self.w2_weight = torch.nn.Parameter(
-            torch.stack(w2_pack).view(torch.int8), False
+            torch.stack(w2_pack).view(torch.int8).to(device), False
         )
         self.w13_weight_scale_inv = torch.nn.Parameter(
-            torch.stack(w13_scale).view(torch.float8_e8m0fnu), False
+            torch.stack(w13_scale).view(torch.float8_e8m0fnu).to(device), False
         )
         self.w2_weight_scale_inv = torch.nn.Parameter(
-            torch.stack(w2_scale).view(torch.float8_e8m0fnu), False
+            torch.stack(w2_scale).view(torch.float8_e8m0fnu).to(device), False
         )
         self._w13_fp32 = torch.stack(self._w13_fp32)
         self._w2_fp32 = torch.stack(self._w2_fp32)
@@ -140,10 +147,11 @@ class _DummyMxfp4Moe(torch.nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        out = torch.zeros_like(hidden, dtype=torch.float32)
-        for token in range(hidden.shape[0]):
-            acc = torch.zeros(hidden.shape[1], dtype=torch.float32, device=hidden.device)
-            x = hidden[token].float()
+        cpu_hidden = hidden.cpu()
+        out = torch.zeros_like(cpu_hidden, dtype=torch.float32)
+        for token in range(cpu_hidden.shape[0]):
+            acc = torch.zeros(cpu_hidden.shape[1], dtype=torch.float32)
+            x = cpu_hidden[token].float()
             for route in range(topk_ids.shape[1]):
                 expert = int(topk_ids[token, route])
                 w13 = self._w13_fp32[expert]
@@ -153,9 +161,9 @@ class _DummyMxfp4Moe(torch.nn.Module):
                 y = F.silu(gate_up[:n] if gate_up.ndim == 1 else gate_up[..., :n]) * (
                     gate_up[n:] if gate_up.ndim == 1 else gate_up[..., n:]
                 )
-                acc = acc + topk_weights[token, route].float() * F.linear(y, w2)
+                acc = acc + topk_weights[token, route].float().cpu() * F.linear(y, w2)
             out[token] = acc
-        return out.to(torch.float16)
+        return out.to(torch.float16).to(hidden.device)
 
 
 @unittest.skipUnless(
@@ -170,8 +178,8 @@ class TestMxfp4Sm70MarlinGemm(CustomTestCase):
         torch.manual_seed(1)
         hidden, intermediate, m = 256, 64, 4
         layer = _DummyMxfp4Moe(1, hidden, intermediate, device)
-        dequant = layer._w2_fp32[0]
         x = torch.randn(m, intermediate, dtype=torch.float16, device=device) * 0.1
+        dequant = layer._w2_fp32[0].to(x.device)
         ref = (x.float() @ dequant.T).to(torch.float16)
         prepare_moe_mxfp4_layer_for_marlin(layer)
 
@@ -307,6 +315,190 @@ class TestMxfp4Sm70MarlinGemm(CustomTestCase):
         )
         self.assertEqual(tuple(out.shape), (1, hidden))
         self.assertTrue(torch.isfinite(out).all())
+
+    def test_one_hot_small_scale_rows_are_bitwise_exact(self):
+        """Issue #6 regression: scale bytes 104..112 must reach the GEMM.
+
+        One-hot activations make each output row a single fp4 weight times
+        its group scale, so the marlin result must equal the fp32 reference
+        bit for bit. Pre-fix, bytes 104..112 clamped to fp16 +0 and the
+        affected rows came out all zero.
+        """
+        device = torch.device("cuda")
+        # 10 groups: subnormals (104..112), the zero-padding sentinel,
+        # fp16 normals (113..142) and the extremes.
+        bytes_per_group = [111, 112, 104, 105, 0, 106, 110, 113, 127, 142]
+        n, k, m = 256, 320, 10
+        layer = _DummyMxfp4Moe(1, n, k, device)
+        # All e2m1 codes +1.0 (checkpoint layout: low nibble even-K, high odd-K).
+        layer.w2_weight = torch.nn.Parameter(
+            torch.full((1, n, k // 2), 0x22, dtype=torch.uint8, device=device).view(
+                torch.int8
+            ),
+            False,
+        )
+        scale_u8 = torch.empty(n, k // 32, dtype=torch.uint8, device=device)
+        for g, byte in enumerate(bytes_per_group):
+            scale_u8[:, g] = byte
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            scale_u8.view(torch.float8_e8m0fnu).unsqueeze(0), False
+        )
+        prepare_moe_mxfp4_layer_for_marlin(layer)
+
+        x = torch.zeros(m, k, dtype=torch.float16, device=device)
+        for t in range(m):
+            x[t, 32 * t + 7] = 1.0
+        ref_rows = [
+            torch.tensor(2.0 ** (byte - 127), dtype=torch.float16, device=device)
+            for byte in bytes_per_group
+        ]
+        ref = torch.stack(ref_rows).unsqueeze(1).expand(m, n).contiguous()
+
+        gemm = _sm70_marlin_v100_gemm_op()
+        self.assertIsNotNone(gemm)
+        _, scalar_types = get_scalar_types()
+        out = gemm(
+            x,
+            None,
+            layer.w2_weight[0],
+            None,
+            layer.w2_weight_scale[0],
+            None,
+            None,
+            None,
+            None,
+            None,
+            layer.workspace,
+            scalar_types.float4_e2m1f.id,
+            m,
+            n,
+            k,
+            True,
+            False,
+            True,
+            False,
+        )
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        # The subnormal scales must arrive as real fp16 subnormals, not zeros.
+        for row, byte in enumerate(bytes_per_group):
+            if 104 <= byte <= 112:
+                self.assertTrue(
+                    bool((out[row] != 0).all()),
+                    f"scale byte {byte} produced a zero row",
+                )
+
+    def test_load_probe_detects_subnormal_scale_decode(self):
+        """A checkpoint with scale bytes 104..112 loads only if this probe passes.
+
+        It must pass on a marlin_v100 built by setup_v100_marlin.sh, and fail on
+        a library without the subnormal-scale patch, which decodes them to zero.
+        """
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            _sm70_marlin_decodes_subnormal_ue8m0,
+        )
+
+        _sm70_marlin_decodes_subnormal_ue8m0.cache_clear()
+        self.assertTrue(_sm70_marlin_decodes_subnormal_ue8m0())
+
+    def test_fused_moe_one_hot_small_scales_bitwise_exact(self):
+        """Issue #6 regression at the real DSV4.1-Flash routed geometry.
+
+        w13 (n=4608, k=5120, 160 groups) with -1017-style scale bytes; one
+        token, all six routes on expert 0. Each one-hot position p selects
+        group p//32, so every route row must equal fp16(2**(byte-127)) of
+        that group exactly. Pre-fix, bytes 104..112 clamped to fp16 +0.
+        """
+        from sglang.kernels.ops.moe.moe_align_single_token import (
+            moe_align_single_token,
+        )
+        from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+
+        device = torch.device("cuda")
+        bytes_per_group = [111, 112, 104, 105, 0, 106, 110, 113, 142]
+        n13 = DSV41_FLASH_MOE_INTERMEDIATE_SIZE * 2
+        k = DSV41_FLASH_HIDDEN_SIZE
+        topk = DSV41_FLASH_NUM_EXPERTS_PER_TOK
+        # Hand-built layer: _DummyMxfp4Moe's random quantize path would spike
+        # fp32 memory at this geometry and the host has little GPU headroom.
+        layer = torch.nn.Module()
+        layer.orig_dtype = torch.float16
+        layer.w13_weight = torch.nn.Parameter(
+            torch.full((1, n13, k // 2), 0x22, dtype=torch.uint8, device=device).view(
+                torch.int8
+            ),
+            False,
+        )
+        scale_u8 = torch.empty(n13, k // 32, dtype=torch.uint8, device=device)
+        for g in range(k // 32):
+            scale_u8[:, g] = bytes_per_group[g % len(bytes_per_group)]
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            scale_u8.view(torch.float8_e8m0fnu).unsqueeze(0), False
+        )
+        # w2 only has to pack cleanly; it is not exercised below.
+        layer.w2_weight = torch.nn.Parameter(
+            torch.zeros((1, k, DSV41_FLASH_MOE_INTERMEDIATE_SIZE // 2), dtype=torch.uint8, device=device).view(torch.int8),
+            False,
+        )
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            torch.full(
+                (1, k, DSV41_FLASH_MOE_INTERMEDIATE_SIZE // 32),
+                127,
+                dtype=torch.uint8,
+                device=device,
+            ).view(torch.float8_e8m0fnu),
+            False,
+        )
+        prepare_moe_mxfp4_layer_for_marlin(layer)
+
+        topk_ids = torch.zeros((1, topk), dtype=torch.int32, device=device)
+        topk_weights = torch.ones((1, topk), dtype=torch.float32, device=device)
+        block = 8
+        sorted_ids, expert_ids, n_post = moe_align_single_token(topk_ids, block)
+        _, scalar_types = get_scalar_types()
+        for g, byte in enumerate(bytes_per_group):
+            x = torch.zeros(1, k, dtype=torch.float16, device=device)
+            x[0, 32 * g + 7] = 1.0
+            out = torch.empty(topk, n13, dtype=torch.float16, device=device)
+            moe_wna16_marlin_gemm(
+                x,
+                out,
+                layer.w13_weight,
+                None,
+                layer.w13_weight_scale,
+                None,
+                None,
+                None,
+                None,
+                layer.workspace,
+                sorted_ids,
+                expert_ids,
+                n_post,
+                topk_weights,
+                moe_block_size=block,
+                top_k=topk,
+                mul_topk_weights=False,
+                is_ep=False,
+                b_q_type=scalar_types.float4_e2m1f,
+                size_m=1,
+                size_n=n13,
+                size_k=k,
+                is_k_full=True,
+                use_atomic_add=False,
+                use_fp32_reduce=True,
+                is_zp_float=False,
+            )
+            ref = torch.full(
+                (topk, n13),
+                2.0 ** (byte - 127),
+                dtype=torch.float16,
+                device=device,
+            )
+            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+            if 104 <= byte <= 112:
+                self.assertTrue(
+                    bool((out != 0).all()),
+                    f"scale byte {byte} produced zero route rows",
+                )
 
     def test_dsv41_decode_pin_matches_auto(self):
         """Pinned CTA must match marlin_v100 auto at DSV4.1 decode shapes."""
