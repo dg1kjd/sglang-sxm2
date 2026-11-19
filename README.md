@@ -21,9 +21,9 @@ SXM2 (NVLink) is only needed for speed. Any set of 32 GB V100s works, PCIe cards
 | **[Qwen3.8-Flash-Next](docs/v100/Qwen3.8-Flash-Next.md)**, 125B MoE, NVFP4, MTP | 4× V100 32 GB | 262k | Coding and chat on four cards, image input, up to 3 parallel requests |
 | **[DeepSeek-V4.1-Flash](docs/v100/DeepSeek-V4.1-Flash.md)**, official MXFP8 + MXFP4, DSpark | 8× V100 32 GB, ~300 GiB host RAM | 256k | **Best reasoning and world knowledge** here. The full official checkpoint, for agentic coding where answer quality matters more than speed |
 | **[MiniMax-H3](docs/v100/MiniMax-H3.md)**, video + audio | 4× V100 32 GB | 4–15 s clips | Text-to-video, keyframes, reference image/video/audio |
-| **[SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B)**, 9B looped, fp16 *(experimental)* | 4× V100 32 GB | 262k | Experimental. A small model with image input, up to 6 parallel requests. See [its section](#sensenova-loop-9b-experimental) |
+| **[SenseNova-Loop-9B](docs/v100/SenseNova-Loop-9B.md)**, 9B looped, fp16 *(experimental)* | 4× V100 32 GB | 262k | Experimental. A small model with image input, 12 parallel requests per 4 GPUs, a second copy on GPUs 4–7 with `SENSENOVA_DP=2` |
 
-Each model page has the full measurements, the exact launch recipe, and why each flag has its value. SenseNova-Loop-9B has no page; its section below is all there is. Other models may load, but they are untested here.
+Each model page has the full measurements, the exact launch recipe, and why each flag has its value. Other models may load, but they are untested here.
 
 **Which one fits?**
 - **8 cards:** GLM-5.3-Flash for fast turns, with images and video. DeepSeek-V4.1-Flash for the hardest problems, if the host has the RAM.
@@ -73,8 +73,8 @@ On 4 GPUs, a 5 s 960×544 clip takes 50 steps of 10–12 s each. A 5 s 1344×768
 
 A 9B model that runs layers 4–27 twice for each token. It runs in fp16 on 4 GPUs, without MTP.
 
-- **Decode:** ~65 tok/s for one stream. Up to six requests run at once. The KV pool holds 854k tokens, so about three of them can be at the full 262k context.
-- **Turns:** a short tool-call turn answers in ~0.11 s. With a 245k conversation cached, a short follow-up question takes ~4.6 s; the cold 245k prompt takes 131 s.
+- **Decode:** ~70 tok/s for one stream, ~617 tok/s summed over 12 streams at ~19k context. Up to 12 requests run at once. The KV pool holds 854k tokens, so about three of them can be at the full 262k context. `SENSENOVA_DP=2` (or `auto`) runs a second copy on GPUs 4–7 behind the same port: 1051 tok/s over 24 streams, for batch jobs (each copy keeps its own prefix cache).
+- **Turns:** a short tool-call turn answers in ~0.11 s. With a 245k conversation cached, a short follow-up question takes ~1.4 s; the cold 245k prompt takes ~110–130 s.
 - **Images:** a 3840×2160 image (8,202 tokens) takes ~4 s.
 - **Sampling:** without a top-k cut the model can draw a very unlikely token and then repeat it until `max_tokens` ([Known issues](docs/v100/Known-Issues.md)). The serve script therefore sets top_k 20 for requests that set none. A request's own `top_k` wins.
 - **Thinking** is on by default. Turn it off with `"chat_template_kwargs": {"enable_thinking": false}` (OpenAI) or `"thinking": {"type": "disabled"}` (Anthropic). There are no effort levels.
@@ -89,7 +89,7 @@ A 9B model that runs layers 4–27 twice for each token. It runs in fp16 on 4 GP
 ## Requirements
 
 - **GPUs:** V100 with **32 GB**. SXM2 with NVLink is the measured setup. PCIe V100s run the same scripts, slower; GLM and Qwen need the interconnect switches under "PCIe V100s" on their pages.
-- **Host RAM:** GLM ~23 GB, up to ~29 GB with images. Qwen ~134 GB with the host KV tier, so plan for 160 GB. DeepSeek ~300 GiB (Engram on 1 GiB hugepages plus pinned expert spill). Each model page has the breakdown. SenseNova ~15 GB.
+- **Host RAM:** GLM ~23 GB, up to ~29 GB with images. Qwen ~134 GB with the host KV tier, so plan for 160 GB. DeepSeek ~300 GiB (Engram on 1 GiB hugepages plus pinned expert spill). SenseNova ~15 GB. Each model page has the breakdown.
 - **Disk:** GLM 190 GB, Qwen 126 GB, DeepSeek 476 GB, SenseNova 18 GB, plus the H3 checkpoint.
 - **CUDA 12.8 or 12.9.** CUDA 13 dropped Volta.
 - **GCC ≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, which many distros now default to.

@@ -1764,6 +1764,9 @@ class Envs:
     SGLANG_SM70_MTP_GDN = EnvBool(True)
     SGLANG_SM70_QSA_COMBINE = EnvBool(True)
     SGLANG_SM70_QSA_DRAFT_EXTEND_GRAPH = EnvBool(True)
+    # Native split-KV decode for group-4 D256 attention over fp16 KV at any batch
+    # size (SenseNova-Loop-9B at TP 4). 0 falls back to Triton split-K for comparisons.
+    SGLANG_SM70_FP16_GROUPED_DECODE = EnvBool(True)
     # GLM-5.3-Flash NVFP4 batch-1..4 decode on Volta HMMA instead of Marlin:
     # dense/shared-expert GEMV and routed experts. fp32 accumulation, so
     # outputs differ from Marlin in the last fp16 bit.

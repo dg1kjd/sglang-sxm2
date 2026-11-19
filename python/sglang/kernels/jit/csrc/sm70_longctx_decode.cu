@@ -279,8 +279,9 @@ decode_partial_kernel(const __half* __restrict__ q,
         float p = 0.f;
         if (n < tile_tokens) {
           p = exp2f((scores[r * kBlockN + n] - m_new) * scale_log2);
-          probs[r * kBlockN + n] = __float2half(p);
         }
+        // PV reads all kBlockN entries; stale shared memory past the tile can be NaN.
+        probs[r * kBlockN + n] = __float2half(p);
         loc_sum = p;
       }
 #pragma unroll

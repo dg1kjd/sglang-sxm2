@@ -466,6 +466,17 @@ register_kernel(
         ),
     )
 )
+# SM70 split-KV decode, D256 fp16 KV, 2/4/8 q heads per kv head, any batch size.
+register_kernel(
+    KernelSpec(
+        op="attention.sm70_grouped_decode",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.sm70_grouped_decode:sm70_grouped_decode",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+    )
+)
 
 register_kernel(
     KernelSpec(

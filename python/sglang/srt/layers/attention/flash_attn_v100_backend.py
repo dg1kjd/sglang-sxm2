@@ -10,8 +10,10 @@ Native prefix handling is via ``prefix_kv_lens`` — no ragged+paged+merge_state
 double-kernel, no FlattenKV, no FlashInfer wrapper ``plan()`` CPU overhead.
 
 Decode uses an exact grouped TileLang split-KV kernel for Qwen TP4
-H6/Hkv1/D256 FP16/E4M3/E5M2. Other shapes retain SGLang's Triton SM70 split-K
-path. No external FlashAttention-V100 package is imported or installed.
+H6/Hkv1/D256 FP16/E4M3/E5M2 at batch 1, and the native CUDA split-KV kernel
+``sm70_grouped_decode`` for group-4 D256 FP16 KV at any batch size. Other shapes
+retain SGLang's Triton SM70 split-K path. No external FlashAttention-V100
+package is imported or installed.
 
 The KV cache layout is shared with the Triton decode path (which views the 4D
 cache as flat 3D — see ``triton_backend._flatten_paged_kv_cache``).
@@ -26,6 +28,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 
@@ -252,6 +255,12 @@ class FlashAttnV100Backend(AttentionBackend):
         self._triton = TritonAttnBackend(
             model_runner,
             skip_prefill=_should_skip_triton_prefill(model_runner),
+        )
+        self._fp16_grouped_decode_enabled = (
+            envs.SGLANG_SM70_FP16_GROUPED_DECODE.get()
+            and model_runner.kv_cache_dtype == torch.float16
+            and not self._triton.use_mla
+            and self._triton.dcp_size == 1
         )
 
         self.forward_metadata: Optional[FlashAttnV100ExtendMetadata] = None
@@ -876,6 +885,85 @@ class FlashAttnV100Backend(AttentionBackend):
             and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1
         )
 
+    def _can_use_fp16_grouped_decode(
+        self,
+        q: torch.Tensor,
+        layer: "RadixAttention",
+        sinks,
+        score_mod,
+    ) -> bool:
+        if not self._fp16_grouped_decode_enabled:
+            return False
+        from sglang.kernels.ops.attention.sm70_grouped_decode import MAX_BATCH
+
+        # Group 4 only, so the G6 path above keeps every shape it serves.
+        if not (
+            q.shape[0] <= MAX_BATCH
+            and layer.tp_q_head_num == 4 * layer.tp_k_head_num
+            and layer.qk_head_dim == 256
+            and layer.v_head_dim == 256
+            and q.dtype == torch.float16
+            and sinks is None
+            and score_mod is None
+            and not layer.logit_cap
+            and layer.xai_temperature_len <= 0
+            and layer.sliding_window_size < 0
+            and not layer.is_cross_attention
+            and not layer.use_irope
+        ):
+            return False
+        # fp16 slot rows [tokens, tp_k, 256] only; 4D (HND) pools stay on Triton.
+        row_shape = (layer.tp_k_head_num, 256)
+        return all(
+            cache.ndim == 3
+            and cache.shape[1:] == row_shape
+            and cache.dtype == torch.float16
+            and cache.stride(-1) == 1
+            for cache in self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        )
+
+    def _forward_fp16_grouped_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.sm70_grouped_decode import (
+            sm70_grouped_decode,
+        )
+
+        if save_kv_cache:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                forward_batch.out_cache_loc,
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
+            )
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        # Same descale rule as TritonAttnBackend.forward_decode.
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale, v_descale = layer.k_scale_float, layer.v_scale_float
+        else:
+            k_descale, v_descale = 1.0, 1.0
+        # Triton's decode metadata, also built under CUDA graph capture/replay.
+        metadata = self._triton.forward_metadata
+        out = sm70_grouped_decode(
+            q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k_cache,
+            v_cache,
+            metadata.kv_indptr,
+            metadata.kv_indices,
+            softmax_scale=layer.scaling,
+            k_scale=k_descale,
+            v_scale=v_descale,
+        )
+        return out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def _forward_grouped_decode(
         self,
         q: torch.Tensor,
@@ -957,6 +1045,17 @@ class FlashAttnV100Backend(AttentionBackend):
         sinks = kwargs.get("sinks")
         if self._can_use_grouped_decode(q, layer, sinks):
             return self._forward_grouped_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+            )
+        if self._can_use_fp16_grouped_decode(
+            q, layer, sinks, score_mod=kwargs.get("score_mod")
+        ):
+            return self._forward_fp16_grouped_decode(
                 q,
                 k,
                 v,

@@ -8,7 +8,13 @@
 # Env overrides:
 #   SENSENOVA_MODEL=/path/to/SenseNova-Loop-9B   (required)
 #   SGLANG_V100_VENV=/path/to/venv               (default: $HOME/sglang-v100-venv)
-#   SENSENOVA_GPUS=0,1,2,3                       (one 4-GPU NVLink domain)
+#   SENSENOVA_DP=1                               (copies of the model behind one port, 4 GPUs each.
+#                                                 auto: one copy per 4 GPUs found. Each copy keeps its
+#                                                 own prefix cache, so more than 1 suits batch jobs,
+#                                                 not one long agent session)
+#   SENSENOVA_GPUS=0,1,2,3                       (default: the first 4*DP GPUs; consecutive groups of
+#                                                 four should share an NVLink domain)
+#   SENSENOVA_MAX_RUNNING=12                     (running requests per copy)
 #   SGLANG_V100_HOST=0.0.0.0  SGLANG_V100_PORT=11435
 #   SENSENOVA_MEM_FRACTION=0.85
 #   SENSENOVA_TOP_K=20                           (top_k for requests that set none; -1: no cut)
@@ -23,7 +29,21 @@ MODEL="${SENSENOVA_MODEL:-}"
 [[ -n "$MODEL" ]] || { echo "set SENSENOVA_MODEL to the SenseNova-Loop-9B checkout" >&2; exit 1; }
 [[ -f "$MODEL/config.json" ]] || { echo "no config.json at $MODEL" >&2; exit 1; }
 
-export CUDA_VISIBLE_DEVICES="${SENSENOVA_GPUS:-0,1,2,3}"
+DP="${SENSENOVA_DP:-1}"
+if [[ -n "${SENSENOVA_GPUS:-}" ]]; then
+  IFS=, read -ra gpus <<< "$SENSENOVA_GPUS"
+else
+  mapfile -t gpus < <(nvidia-smi --query-gpu=index --format=csv,noheader)
+fi
+[[ "$DP" == auto ]] && DP=$(( ${#gpus[@]} / 4 ))
+[[ "$DP" =~ ^[1-9][0-9]*$ ]] || { echo "SENSENOVA_DP must be a positive number or auto; ${#gpus[@]} GPUs found (4 per copy)" >&2; exit 1; }
+if [[ -z "${SENSENOVA_GPUS:-}" ]]; then
+  gpus=("${gpus[@]:0:$((4 * DP))}")
+fi
+(( ${#gpus[@]} == 4 * DP )) || { echo "SENSENOVA_DP=$DP needs $((4 * DP)) GPUs, have ${#gpus[@]} (${gpus[*]})" >&2; exit 1; }
+export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${gpus[*]}")"
+echo "SenseNova: $DP copies x TP 4 on GPUs $CUDA_VISIBLE_DEVICES"
+MAX_RUNNING="${SENSENOVA_MAX_RUNNING:-12}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 # The SM70 JIT kernels shell out to the venv's `ninja`.
 export PATH="$VENV/bin:$CUDA_HOME/bin:$PATH"
@@ -62,15 +82,17 @@ args=(
   --kv-cache-dtype auto
   # Four KV heads: TP 4 gives each rank one.
   --tensor-parallel-size 4
+  --data-parallel-size "$DP"
+  --load-balance-method total_tokens
   --host "${SGLANG_V100_HOST:-0.0.0.0}"
   --port "${SGLANG_V100_PORT:-11435}"
   --mem-fraction-static "${SENSENOVA_MEM_FRACTION:-0.85}"
   --context-length 262144
-  --max-running-requests 6
+  --max-running-requests "$MAX_RUNNING"
   --chunked-prefill-size 4096
   --max-prefill-tokens 4096
-  --cuda-graph-max-bs-decode 6
-  --cuda-graph-bs-decode 1 2 3 4 5 6
+  --cuda-graph-max-bs-decode "$MAX_RUNNING"
+  --cuda-graph-bs-decode $(seq 1 "$MAX_RUNNING")
   --disable-prefill-cuda-graph
   --mamba-radix-cache-strategy extra_buffer
   --enable-cache-report
