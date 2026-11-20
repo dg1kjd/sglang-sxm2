@@ -250,7 +250,7 @@ def _random_inputs(rows, mode, gen):
     return x, _fused_ids(rows, mode, gen), wts.flatten().contiguous()
 
 
-@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8, 12, 16])
 @pytest.mark.parametrize("mode", ["distinct", "shared", "invalid"])
 def test_sm70_nvfp4_moe_two_kernel_path_matches_legacy_bits(fused_weights, rows, mode):
     """The two-kernel decode folds partials in the four-kernel order, so it must be
@@ -266,7 +266,7 @@ def test_sm70_nvfp4_moe_two_kernel_path_matches_legacy_bits(fused_weights, rows,
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("rows", [1, 4, 5, 16])
 def test_sm70_nvfp4_moe_two_kernel_graph_replay_with_changing_routes(
     fused_weights, rows
 ):

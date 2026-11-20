@@ -1762,6 +1762,8 @@ class Envs:
     SGLANG_SM70_MTP_SMALL_GEMM = EnvBool(True)
     SGLANG_SM70_MTP_QKVZBA = EnvBool(True)
     SGLANG_SM70_MTP_GDN = EnvBool(True)
+    SGLANG_SM70_NVFP4_MOE_GROUPED_VERIFY = EnvBool(True)
+    SGLANG_SM70_QSA_GROUPED_DECODE = EnvBool(True)
     SGLANG_SM70_QSA_COMBINE = EnvBool(True)
     SGLANG_SM70_QSA_DRAFT_EXTEND_GRAPH = EnvBool(True)
     # Native split-KV decode for group-4 D256 attention over fp16 KV at any batch

@@ -82,7 +82,7 @@ def sm70_nvfp4_moe_decode(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the exact TP4 M<=4/H=2560/I=160/top-k=10 decode shape."""
+    """Run the exact TP4 M<=16/H=2560/I=160/top-k=10 decode shape."""
     ext = _load_sm70_nvfp4_moe_decode_ops()
     if ext is None:
         raise RuntimeError("SM70 NVFP4 MoE decode extension is unavailable")
@@ -109,7 +109,7 @@ def sm70_nvfp4_moe_decode(
             (num_routes, 5, 2560), dtype=torch.float32, device=device
         )
     output = torch.empty_like(hidden_states)
-    (ext.decode if aligned else ext.decode_legacy)(
+    operands = (
         hidden_states,
         w13,
         w2,
@@ -124,6 +124,15 @@ def sm70_nvfp4_moe_decode(
         down_partials,
         output,
     )
+    if aligned:
+        route_groups = torch.empty(
+            (num_routes + 1 if batch_size > 4 else 0, 2),
+            dtype=torch.int32,
+            device=device,
+        )
+        ext.decode(*operands, route_groups)
+    else:
+        ext.decode_legacy(*operands)
     return output
 
 

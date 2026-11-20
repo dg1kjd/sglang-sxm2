@@ -17,7 +17,10 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 
+#include <mma.h>
+
 #include <cstdint>
+#include <type_traits>
 
 namespace sm70_longctx {
 
@@ -36,7 +39,8 @@ constexpr int kIndexerThreads = 256;
 constexpr int kIndexerWarps = kIndexerThreads / 32;
 constexpr int kIndexerHeads = 4;
 constexpr int kIndexerDim = 128;
-constexpr int kIndexerPageSize = 4;
+constexpr int kQsaCompressRatio = 4;
+constexpr int kIndexerBlockTopK = 512;
 constexpr int kIndexerKeysPerWarp = 8;
 constexpr int kIndexerKeysPerBlock = kIndexerWarps * kIndexerKeysPerWarp;
 
@@ -345,14 +349,15 @@ decode_partial_kernel(const __half* __restrict__ q,
 // fallback, this resolves the selected logical positions while loading the
 // cache and keeps K/V shared by all six query heads.  No FP16 compact-KV
 // scratch is written or read.
-template <typename KV>
+template <typename KV, bool Compressed>
 __global__ void __launch_bounds__(kThreads, 1)
 qsa_decode_partial_kernel(
     const __half* __restrict__ q, const KV* __restrict__ k_cache,
     const KV* __restrict__ v_cache,
     const int* __restrict__ req_to_token,
     const int* __restrict__ req_indices, const int* __restrict__ indices,
-    const int* __restrict__ seq_lens, const int req_stride, const int topk,
+    const int* __restrict__ seq_lens, const int* __restrict__ query_positions,
+    const int req_stride, const int index_stride, const int topk,
     const int max_splits, const int min_tokens_per_split,
     const float score_scale, __half* __restrict__ partial_o,
     float* __restrict__ partial_lse) {
@@ -379,6 +384,19 @@ qsa_decode_partial_kernel(
   __shared__ float scores[kGroup * kBlockN];
   __shared__ __half probs[kGroup * kBlockN];
   __shared__ int slots[kBlockN];
+
+  const int* selected_row = indices + (int64_t)seq_id * index_stride;
+  int group_tokens = 0, tail_start = 0, visible_tokens = 0;
+  if constexpr (Compressed) {
+    // Ordered top-k returns a compact prefix of selected groups. If the
+    // final entry is padding, the number of complete visible groups follows
+    // from this row's sequence length. The partial group comes from its
+    // logical query position, not the request's last or padded query row.
+    group_tokens = min(index_stride, seq_len / kQsaCompressRatio)
+                   * kQsaCompressRatio;
+    visible_tokens = query_positions[seq_id] + 1;
+    tail_start = (visible_tokens / kQsaCompressRatio) * kQsaCompressRatio;
+  }
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -413,7 +431,20 @@ qsa_decode_partial_kernel(
       const int selected = tile_begin + tid;
       int slot = -1;
       if (selected < split_end) {
-        const int logical = indices[(int64_t)seq_id * topk + selected];
+        int logical = -1;
+        if constexpr (Compressed) {
+          if (selected < group_tokens) {
+            const int group = selected_row[selected / kQsaCompressRatio];
+            if (group >= 0) {
+              logical = group * kQsaCompressRatio + selected % kQsaCompressRatio;
+            }
+          } else {
+            const int tail = tail_start + selected - group_tokens;
+            if (tail < visible_tokens) logical = tail;
+          }
+        } else {
+          logical = selected_row[selected];
+        }
         if (logical >= 0 && logical < seq_len) {
           slot = req_to_token[(int64_t)req_index * req_stride + logical];
         }
@@ -530,74 +561,194 @@ qsa_decode_partial_kernel(
   }
 }
 
-// QSA indexer decode scoring for Qwen3.8.  A warp owns one compressed key,
-// reads its 128 FP16 values once, and accumulates the four query-head scores
-// in registers.  This avoids padding four real heads to Volta MMA's 16-head
-// tile and emits the exact FP32 logits consumed by fast_topk.
+// SIMT scorer for one query row or for a tile with different physical
+// pages across query rows. Keep the original FP32 dot order.
+template <int PageSize>
+__device__ __forceinline__ void qsa_indexer_score_key(
+    const __half* q, const __half* k_cache, const int* page_table,
+    int position, int lane, float score_scale, float* logits) {
+  const int physical_page = page_table[position / PageSize];
+  const __half2* key = reinterpret_cast<const __half2*>(
+      k_cache + ((int64_t)physical_page * PageSize + position % PageSize) *
+                    kIndexerDim);
+  const __half2 k0 = key[lane * 2];
+  const __half2 k1 = key[lane * 2 + 1];
+  float score = 0.f;
+#pragma unroll
+  for (int h = 0; h < kIndexerHeads; ++h) {
+    const __half2* qh = reinterpret_cast<const __half2*>(q + h * kIndexerDim);
+    const __half2 q0 = qh[lane * 2];
+    const __half2 q1 = qh[lane * 2 + 1];
+    float acc = fmaf(__half2float(q0.x), __half2float(k0.x), 0.f);
+    acc = fmaf(__half2float(q0.y), __half2float(k0.y), acc);
+    acc = fmaf(__half2float(q1.x), __half2float(k1.x), acc);
+    acc = fmaf(__half2float(q1.y), __half2float(k1.y), acc);
+#pragma unroll
+    for (int off = 16; off; off >>= 1) {
+      acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    score += fmaxf(acc, 0.f);
+  }
+  if (lane == 0) logits[position] = score / score_scale;
+}
+
+template <int PageSize>
 __global__ void __launch_bounds__(kIndexerThreads, 2)
 qsa_indexer_decode_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k_cache,
-    const int* __restrict__ page_table,
-    const int* __restrict__ context_lens, const int max_pages,
-    const int max_model_len, const float score_scale,
+    const int* __restrict__ page_table, const int* __restrict__ context_lens,
+    int max_pages, int max_model_len, int min_scored_len, float score_scale,
     float* __restrict__ logits) {
   const int seq_id = blockIdx.y;
-  const int tid = threadIdx.x;
-  const int warp = tid >> 5;
-  const int lane = tid & 31;
-  const int context = context_lens[seq_id];
+  const int context = min(context_lens[seq_id], max_model_len);
   const int block_begin = blockIdx.x * kIndexerKeysPerBlock;
-  if (block_begin >= context) {
-    return;
-  }
+  if (context <= min_scored_len || block_begin >= context) return;
 
-  __shared__ __half qs[kIndexerHeads * kIndexerDim];
-  for (int i = tid; i < kIndexerHeads * kIndexerDim; i += kIndexerThreads) {
-    qs[i] = q[(int64_t)seq_id * kIndexerHeads * kIndexerDim + i];
+  constexpr int kQueryElements = kIndexerHeads * kIndexerDim;
+  __shared__ __align__(16) __half qs[kQueryElements];
+  const int tid = threadIdx.x;
+  for (int i = tid; i < kQueryElements; i += kIndexerThreads) {
+    qs[i] = q[(int64_t)seq_id * kQueryElements + i];
   }
   __syncthreads();
 
 #pragma unroll
   for (int it = 0; it < kIndexerKeysPerWarp; ++it) {
-    const int position = block_begin + it * kIndexerWarps + warp;
-    if (position >= context || position >= max_model_len) {
-      continue;
+    const int position = block_begin + it * kIndexerWarps + (tid >> 5);
+    if (position < context) {
+      qsa_indexer_score_key<PageSize>(
+          qs, k_cache, page_table + (int64_t)seq_id * max_pages, position,
+          tid & 31, score_scale, logits + (int64_t)seq_id * max_model_len);
     }
-    const int logical_page = position / kIndexerPageSize;
-    const int page_offset = position % kIndexerPageSize;
-    const int physical_page =
-        page_table[(int64_t)seq_id * max_pages + logical_page];
-    const __half2* key = reinterpret_cast<const __half2*>(
-        k_cache +
-        ((int64_t)physical_page * kIndexerPageSize + page_offset) *
-            kIndexerDim);
-    const __half2 k0 = key[lane * 2];
-    const __half2 k1 = key[lane * 2 + 1];
-    float scores[kIndexerHeads];
+  }
+}
+
+constexpr int kIndexerQueryRows = 4;
+constexpr int kIndexerTile = 16;
+constexpr int kIndexerGroupWarps = 4;
+constexpr int kIndexerGroupThreads = kIndexerGroupWarps * 32;
+constexpr int kIndexerGroupKeys = kIndexerTile * kIndexerGroupWarps;
+static_assert(kIndexerQueryRows * kIndexerHeads == kIndexerTile);
+
+// Four H4 queries fill a Volta MMA tile exactly. Each warp scores 16
+// shared keys and independently masks the tail of every query row.
+template <int PageSize>
+__global__ void __launch_bounds__(kIndexerGroupThreads)
+qsa_indexer_grouped_kernel(
+    const __half* __restrict__ q, const __half* __restrict__ k_cache,
+    const int* __restrict__ page_table, const int* __restrict__ context_lens,
+    int batch, int max_pages, int max_model_len, int min_scored_len,
+    float score_scale, float* __restrict__ logits) {
+  namespace wmma = nvcuda::wmma;
+  constexpr int kPagesPerTile = kIndexerTile / PageSize;
+  constexpr int kQueryElements = kIndexerHeads * kIndexerDim;
+  const int row_start = blockIdx.y * kIndexerQueryRows;
+  const int row_count = min(kIndexerQueryRows, batch - row_start);
+  const int block_begin = blockIdx.x * kIndexerGroupKeys;
+  int contexts[kIndexerQueryRows];
+  int context_max = 0;
 #pragma unroll
-    for (int h = 0; h < kIndexerHeads; ++h) {
-      const __half2* qh =
-          reinterpret_cast<const __half2*>(qs + h * kIndexerDim);
-      const __half2 q0 = qh[lane * 2];
-      const __half2 q1 = qh[lane * 2 + 1];
-      float acc = 0.f;
-      acc = fmaf(__half2float(q0.x), __half2float(k0.x), acc);
-      acc = fmaf(__half2float(q0.y), __half2float(k0.y), acc);
-      acc = fmaf(__half2float(q1.x), __half2float(k1.x), acc);
-      acc = fmaf(__half2float(q1.y), __half2float(k1.y), acc);
+  for (int row = 0; row < kIndexerQueryRows; ++row) {
+    const int context =
+        row < row_count ? min(context_lens[row_start + row], max_model_len) : 0;
+    contexts[row] = context > min_scored_len ? context : 0;
+    context_max = max(context_max, contexts[row]);
+  }
+  if (block_begin >= context_max) return;
+
+  __shared__ __align__(32) __half qs[kIndexerQueryRows * kQueryElements];
+  __shared__ __align__(32) float scores[kIndexerGroupWarps][kIndexerTile * kIndexerTile];
+  __shared__ __align__(32) __half keys[PageSize == kIndexerTile ? 1 : kIndexerGroupWarps]
+                                       [PageSize == kIndexerTile ? 1 : kIndexerTile * kIndexerDim];
+  const int tid = threadIdx.x;
+  for (int i = tid; i < kIndexerQueryRows * kQueryElements; i += kIndexerGroupThreads) {
+    qs[i] = i < row_count * kQueryElements
+                ? q[(int64_t)row_start * kQueryElements + i]
+                : __float2half(0.f);
+  }
+  __syncthreads();
+
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int tile_begin = block_begin + warp * kIndexerTile;
+  if (tile_begin >= context_max) return;
+  const int* page_rows = page_table + (int64_t)row_start * max_pages;
+  float* logits_rows = logits + (int64_t)row_start * max_model_len;
+  int pages[kPagesPerTile];
+  bool compatible = true;
 #pragma unroll
-      for (int off = 16; off; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
+  for (int i = 0; i < kPagesPerTile; ++i) {
+    const int position = tile_begin + i * PageSize;
+    int physical_page = -1;
+#pragma unroll
+    for (int row = 0; row < kIndexerQueryRows; ++row) {
+      if (position < contexts[row]) {
+        const int page = page_rows[(int64_t)row * max_pages + position / PageSize];
+        compatible &= physical_page < 0 || physical_page == page;
+        physical_page = page;
       }
-      scores[h] = acc;
     }
-    if (lane == 0) {
+    pages[i] = physical_page;
+  }
+  if (!compatible) {
+    for (int row = 0; row < row_count; ++row) {
+      const int end = min(tile_begin + kIndexerTile, contexts[row]);
+      for (int position = tile_begin; position < end; ++position) {
+        qsa_indexer_score_key<PageSize>(
+            qs + row * kQueryElements, k_cache,
+            page_rows + (int64_t)row * max_pages, position, lane, score_scale,
+            logits_rows + (int64_t)row * max_model_len);
+      }
+    }
+    return;
+  }
+
+  const __half* key_tile;
+  if constexpr (PageSize == kIndexerTile) {
+    key_tile = k_cache + (int64_t)pages[0] * PageSize * kIndexerDim;
+  } else {
+    // A 16-key MMA tile spans four physical pages for the legacy layout.
+    constexpr int kPageVectors = PageSize * kIndexerDim / 8;
+    auto* shared = reinterpret_cast<uint4*>(keys[warp]);
+#pragma unroll
+    for (int page = 0; page < kPagesPerTile; ++page) {
+      for (int i = lane; i < kPageVectors; i += 32) {
+        shared[page * kPageVectors + i] =
+            pages[page] >= 0
+                ? reinterpret_cast<const uint4*>(k_cache)[(int64_t)pages[page] *
+                                                           kPageVectors + i]
+                : make_uint4(0, 0, 0, 0);
+      }
+    }
+    __syncwarp();
+    key_tile = keys[warp];
+  }
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+  wmma::fill_fragment(acc, 0.f);
+#pragma unroll
+  for (int d = 0; d < kIndexerDim; d += 16) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> query;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> key;
+    wmma::load_matrix_sync(query, qs + d, kIndexerDim);
+    wmma::load_matrix_sync(key, key_tile + d, kIndexerDim);
+    wmma::mma_sync(acc, query, key, acc);
+  }
+  auto* tile_scores = scores[warp];
+  wmma::store_matrix_sync(tile_scores, acc, kIndexerTile, wmma::mem_row_major);
+  __syncwarp();
+  for (int i = lane; i < row_count * kIndexerTile; i += 32) {
+    const int row = i / kIndexerTile;
+    const int token = i % kIndexerTile;
+    const int position = tile_begin + token;
+    if (position < contexts[row]) {
       float score = 0.f;
 #pragma unroll
       for (int h = 0; h < kIndexerHeads; ++h) {
-        score += fmaxf(scores[h], 0.f);
+        score += fmaxf(tile_scores[(row * kIndexerHeads + h) * kIndexerTile + token],
+                       0.f);
       }
-      logits[(int64_t)seq_id * max_model_len + position] = score / score_scale;
+      logits_rows[(int64_t)row * max_model_len + position] = score / score_scale;
     }
   }
 }
@@ -822,7 +973,8 @@ void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
                      torch::Tensor req_indices, torch::Tensor indices,
                      torch::Tensor seq_lens, int64_t max_splits,
                      int64_t min_tokens_per_split, double softmax_scale,
-                     torch::Tensor partial_o, torch::Tensor partial_lse) {
+                     torch::Tensor partial_o, torch::Tensor partial_lse,
+                     const c10::optional<torch::Tensor>& query_positions) {
   using namespace sm70_longctx;
   c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.scalar_type() == torch::kHalf && q.dim() == 3 &&
@@ -858,29 +1010,39 @@ void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
                   partial_lse.size(1) == max_splits &&
                   partial_lse.size(2) == kGroup,
               "sm70_qsa_decode partial LSE has the wrong shape");
+  const int* positions = nullptr;
+  const int index_stride = indices.size(1);
+  int topk = index_stride;
+  if (query_positions.has_value()) {
+    TORCH_CHECK(index_stride == kIndexerBlockTopK &&
+                    query_positions->scalar_type() == torch::kInt &&
+                    query_positions->numel() == q.size(0),
+                "compressed QSA decode needs 512 groups and an int32 position per row");
+    positions = query_positions->data_ptr<int>();
+    topk = index_stride * kQsaCompressRatio + kQsaCompressRatio - 1;
+  }
   auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(1, (unsigned int)max_splits, (unsigned int)q.size(0));
+  const auto launch = [&](auto type, auto compressed) {
+    using KV = decltype(type);
+    qsa_decode_partial_kernel<KV, decltype(compressed)::value>
+        <<<grid, kThreads, 0, stream>>>(
+            reinterpret_cast<const __half*>(q.data_ptr()),
+            reinterpret_cast<const KV*>(k_cache.data_ptr()),
+            reinterpret_cast<const KV*>(v_cache.data_ptr()),
+            req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
+            indices.data_ptr<int>(), seq_lens.data_ptr<int>(), positions,
+            (int)req_to_token.size(1), index_stride, topk, (int)max_splits,
+            (int)min_tokens_per_split, (float)softmax_scale,
+            reinterpret_cast<__half*>(partial_o.data_ptr()),
+            partial_lse.data_ptr<float>());
+  };
   if (is_e5m2) {
-    qsa_decode_partial_kernel<uint8_t><<<grid, kThreads, 0, stream>>>(
-        reinterpret_cast<const __half*>(q.data_ptr()),
-        k_cache.data_ptr<uint8_t>(), v_cache.data_ptr<uint8_t>(),
-        req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
-        indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
-        (int)req_to_token.size(1), (int)indices.size(1), (int)max_splits,
-        (int)min_tokens_per_split, (float)softmax_scale,
-        reinterpret_cast<__half*>(partial_o.data_ptr()),
-        partial_lse.data_ptr<float>());
+    if (positions) launch(uint8_t{}, std::true_type{});
+    else launch(uint8_t{}, std::false_type{});
   } else {
-    qsa_decode_partial_kernel<__half><<<grid, kThreads, 0, stream>>>(
-        reinterpret_cast<const __half*>(q.data_ptr()),
-        reinterpret_cast<const __half*>(k_cache.data_ptr()),
-        reinterpret_cast<const __half*>(v_cache.data_ptr()),
-        req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
-        indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
-        (int)req_to_token.size(1), (int)indices.size(1), (int)max_splits,
-        (int)min_tokens_per_split, (float)softmax_scale,
-        reinterpret_cast<__half*>(partial_o.data_ptr()),
-        partial_lse.data_ptr<float>());
+    if (positions) launch(__half{}, std::true_type{});
+    else launch(__half{}, std::false_type{});
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -889,16 +1051,17 @@ void sm70_qsa_indexer_decode(torch::Tensor q, torch::Tensor k_cache,
                              torch::Tensor page_table,
                              torch::Tensor context_lens,
                              int64_t max_model_len, double score_scale,
-                             torch::Tensor logits) {
+                             torch::Tensor logits, bool group_queries,
+                             int64_t min_scored_len) {
   using namespace sm70_longctx;
   c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.scalar_type() == torch::kHalf && q.dim() == 3 &&
                   q.size(1) == kIndexerHeads && q.size(2) == kIndexerDim,
               "sm70_qsa_indexer_decode expects FP16 Q [batch,4,128]");
   TORCH_CHECK(k_cache.scalar_type() == torch::kHalf && k_cache.dim() == 4 &&
-                  k_cache.size(1) == kIndexerPageSize &&
+                  (k_cache.size(1) == 4 || k_cache.size(1) == 16) &&
                   k_cache.size(2) == 1 && k_cache.size(3) == kIndexerDim,
-              "sm70_qsa_indexer_decode expects FP16 K [pages,4,1,128]");
+              "sm70_qsa_indexer_decode expects FP16 K [pages,4 or 16,1,128]");
   TORCH_CHECK(page_table.scalar_type() == torch::kInt &&
                   page_table.dim() == 2 && page_table.size(0) == q.size(0) &&
                   context_lens.scalar_type() == torch::kInt &&
@@ -911,16 +1074,32 @@ void sm70_qsa_indexer_decode(torch::Tensor q, torch::Tensor k_cache,
                   logits.size(1) == max_model_len,
               "sm70_qsa_indexer_decode logits have the wrong shape");
   auto stream = at::cuda::getCurrentCUDAStream();
-  const dim3 grid(
-      (unsigned int)((max_model_len + kIndexerKeysPerBlock - 1) /
-                     kIndexerKeysPerBlock),
-      (unsigned int)q.size(0));
-  qsa_indexer_decode_kernel<<<grid, kIndexerThreads, 0, stream>>>(
-      reinterpret_cast<const __half*>(q.data_ptr()),
-      reinterpret_cast<const __half*>(k_cache.data_ptr()),
-      page_table.data_ptr<int>(), context_lens.data_ptr<int>(),
-      (int)page_table.size(1), (int)max_model_len, (float)score_scale,
-      logits.data_ptr<float>());
+  const auto dispatch = [&](auto page_size) {
+    constexpr int PageSize = decltype(page_size)::value;
+    const auto* query = reinterpret_cast<const __half*>(q.data_ptr());
+    const auto* keys = reinterpret_cast<const __half*>(k_cache.data_ptr());
+    const int* pages = page_table.data_ptr<int>();
+    const int* lengths = context_lens.data_ptr<int>();
+    const int batch = q.size(0);
+    const int max_pages = page_table.size(1);
+    if (group_queries) {
+      const dim3 grid((max_model_len + kIndexerGroupKeys - 1) / kIndexerGroupKeys,
+                      (batch + kIndexerQueryRows - 1) / kIndexerQueryRows);
+      qsa_indexer_grouped_kernel<PageSize>
+          <<<grid, kIndexerGroupThreads, 0, stream>>>(
+              query, keys, pages, lengths, batch, max_pages, max_model_len,
+              min_scored_len, score_scale, logits.data_ptr<float>());
+    } else {
+      const dim3 grid((max_model_len + kIndexerKeysPerBlock - 1) /
+                          kIndexerKeysPerBlock,
+                      batch);
+      qsa_indexer_decode_kernel<PageSize><<<grid, kIndexerThreads, 0, stream>>>(
+          query, keys, pages, lengths, max_pages, max_model_len, min_scored_len,
+          score_scale, logits.data_ptr<float>());
+    }
+  };
+  if (k_cache.size(1) == 16) dispatch(std::integral_constant<int, 16>{});
+  else dispatch(std::integral_constant<int, 4>{});
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

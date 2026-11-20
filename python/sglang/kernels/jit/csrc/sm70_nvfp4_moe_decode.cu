@@ -27,6 +27,7 @@
 #include <climits>
 #include <cstdint>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 
 namespace sm70_nvfp4_moe {
 
@@ -488,7 +489,9 @@ constexpr int kGroupsPerSplit1 = (kHidden / kGroupSize) / kSplitK;     // 4
 constexpr int kGroupsPerSplit2 = (kIntermediate / kGroupSize) / kDownSplitK;  // 2
 constexpr int kRouteSplits = kTopK * kDownSplitK;                      // 50
 constexpr int kGateThreads = kSplitK * 8;                              // 320
-constexpr int kMaxRoutes = 32 * kTopK;
+constexpr int kMaxRows = 16;
+constexpr int kPlanThreads = 256;
+static_assert(kMaxRows * kTopK <= kPlanThreads);
 constexpr int kSmemPad = 4;
 
 template <int N>
@@ -523,124 +526,65 @@ __device__ __forceinline__ half2 broadcast_half(const uint32_t (&x)[N], int k) {
   return *reinterpret_cast<const half2*>(&b);
 }
 
-// Route at position p of the stable order "valid experts ascending, invalid
-// last, ties by route index". Every CTA derives the same bijection from
-// topk_ids (deterministic counts + index-ordered ballots), so CTA p picks its
-// route without a planning launch or scratch. Routes that share an expert
-// land in adjacent CTAs, run concurrently, and share their weight stream
-// through L2. Must be called by all T threads of the CTA.
-template <int T>
-__device__ __forceinline__ int sorted_route(const int* __restrict__ topk_ids,
-                                            int n, int p, int* expert_out) {
-  constexpr int kPer = (kMaxRoutes + T - 1) / T;  // routes per thread
-  constexpr int kBins = kExperts + 1;              // bin 512 = invalid id
-  constexpr int kBinsPer = (kBins + T - 1) / T;
-  constexpr int kWarps = T / 32;
-  __shared__ int s_cnt[kBinsPer * T];
-  __shared__ int s_wsum[kWarps];
-  __shared__ unsigned s_mask[kPer * kWarps];
-  __shared__ int s_sel[2];
+// Pack valid routes into same-expert pairs. Keep original route IDs so down
+// can fold weights in the original top-k order. The extra entry holds the
+// group count, allowing a fixed launch grid during CUDA graph replay.
+__global__ void plan_gate_up_routes(const int* __restrict__ ids, int num_routes,
+                                    int2* __restrict__ groups) {
+  using Sort = cub::BlockRadixSort<int, kPlanThreads, 1>;
+  using Scan = cub::BlockScan<int, kPlanThreads>;
+  __shared__ union {
+    typename Sort::TempStorage sort;
+    typename Scan::TempStorage scan;
+  } scratch;
+  __shared__ int sorted[kPlanThreads];
   const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-#pragma unroll
-  for (int b = 0; b < kBinsPer; ++b) s_cnt[tid * kBinsPer + b] = 0;
-  int keys[kPer];
-#pragma unroll
-  for (int i = 0; i < kPer; ++i) {
-    const int r = tid + i * T;
-    keys[i] = -1;
-    if (r < n) {
-      const int e = topk_ids[r];
-      keys[i] = (e >= 0 && e < kExperts) ? e : kExperts;
-    }
-  }
+  const int expert = tid < num_routes ? ids[tid] : -1;
+  int key[1] = {expert >= 0 && expert < kExperts ? expert * kPlanThreads + tid
+                                                : INT_MAX};
+  Sort(scratch.sort).Sort(key);
+  sorted[tid] = key[0];
   __syncthreads();
-#pragma unroll
-  for (int i = 0; i < kPer; ++i)
-    if (keys[i] >= 0) atomicAdd(&s_cnt[keys[i]], 1);
-  __syncthreads();
-  // Exclusive scan of bin counts; the thread owning position p's bin records
-  // (bin, rank within bin).
-  int c[kBinsPer];
-  int v = 0;
-#pragma unroll
-  for (int b = 0; b < kBinsPer; ++b) {
-    c[b] = s_cnt[tid * kBinsPer + b];
-    v += c[b];
+
+  const int key_expert = key[0] / kPlanThreads;
+  int first = tid;
+  if (key[0] != INT_MAX) {
+    while (first > 0 && sorted[first - 1] / kPlanThreads == key_expert) --first;
   }
-  const int own = v;
-#pragma unroll
-  for (int off = 1; off < 32; off <<= 1) {
-    const int y = __shfl_up_sync(0xffffffffu, v, off);
-    if (lane >= off) v += y;
+  const int starts_pair = key[0] != INT_MAX && (tid - first) % 2 == 0;
+  int group, count;
+  Scan(scratch.scan).ExclusiveSum(starts_pair, group, count);
+  if (starts_pair) {
+    const int next = tid + 1 < kPlanThreads ? sorted[tid + 1] : INT_MAX;
+    groups[group] = make_int2(key[0] % kPlanThreads,
+                             next / kPlanThreads == key_expert
+                                 ? next % kPlanThreads
+                                 : -1);
   }
-  if (lane == 31) s_wsum[warp] = v;
-  __syncthreads();
-  int start = v - own;
-#pragma unroll
-  for (int w = 0; w < kWarps; ++w)
-    if (w < warp) start += s_wsum[w];
-#pragma unroll
-  for (int b = 0; b < kBinsPer; ++b) {
-    if (p >= start && p < start + c[b]) {
-      s_sel[0] = tid * kBinsPer + b;
-      s_sel[1] = p - start;
-    }
-    start += c[b];
-  }
-  __syncthreads();
-  const int bin = s_sel[0];
-#pragma unroll
-  for (int i = 0; i < kPer; ++i) {
-    const unsigned m = __ballot_sync(0xffffffffu, keys[i] == bin);
-    if (lane == 0) s_mask[i * kWarps + warp] = m;
-  }
-  __syncthreads();
-  // Routes r = i*T + warp*32 + lane enumerate (i, warp, lane) in index order.
-  int k = s_sel[1];
-  int route = 0;
-#pragma unroll 1
-  for (int j = 0; j < kPer * kWarps; ++j) {
-    unsigned m = s_mask[j];
-    const int cnt = __popc(m);
-    if (k < cnt) {
-      for (int q = 0; q < k; ++q) m &= m - 1;
-      const int i = j / kWarps;
-      route = i * T + (j - i * kWarps) * 32 + (__ffs(m) - 1);
-      break;
-    }
-    k -= cnt;
-  }
-  *expert_out = bin;
-  return route;
+  if (tid == 0) groups[num_routes] = make_int2(count, 0);
 }
 
-// sorted != 0: CTA (p, n_tile) handles the route at sorted position p.
-template <int MINB>
+template <int MINB, bool Grouped = false>
 __global__ void __launch_bounds__(kGateThreads, MINB)
 gate_up_fused_kernel(const __half* __restrict__ input,
                      const uint32_t* __restrict__ weight,
                      const uint8_t* __restrict__ scales,
                      const float* __restrict__ global_scales,
                      const int* __restrict__ topk_ids, int num_routes,
-                     float* __restrict__ pre_act, int sorted) {
+                     float* __restrict__ pre_act,
+                     const int2* __restrict__ groups) {
   constexpr int kStride = 64 + kSmemPad;
   __shared__ __align__(16) float part_s[kSplitK * kStride];
   const int bid = static_cast<int>(blockIdx.x);
-  const int route_pos = bid / kNTiles;
-  const int n_tile = bid - route_pos * kNTiles;
-  int route, expert;
-  if (sorted) {
-    route = sorted_route<kGateThreads>(topk_ids, num_routes, route_pos, &expert);
-  } else {
-    route = route_pos;
-    expert = topk_ids[route];
+  const int group = bid / kNTiles;
+  const int n_tile = bid % kNTiles;
+  int2 routes = make_int2(group, -1);
+  if constexpr (Grouped) {
+    if (group >= groups[num_routes].x) return;
+    routes = groups[group];
   }
-  if (expert < 0 || expert >= kExperts) {
-    return;  // down_fused_kernel never reads pre-activations of such routes.
-  }
-  const int token = route / kTopK;
+  const int expert = topk_ids[routes.x];
+  if (expert < 0 || expert >= kExperts) return;
   const int qword = threadIdx.x & 7;  // qword_in_tile
   const int split = threadIdx.x >> 3;
   const int group0 = split * kGroupsPerSplit1;
@@ -649,24 +593,33 @@ gate_up_fused_kernel(const __half* __restrict__ input,
   const uint8_t* sp = scales + static_cast<int64_t>(expert) *
                                    (kHidden / kGroupSize) * kGateUp +
                       group0 * kGateUp + (n_tile * 8 + qword) * 8;
-  const __half* xp = input + token * kHidden + group0 * kGroupSize;
+  const __half* xp = input + (routes.x / kTopK) * kHidden + group0 * kGroupSize;
+  const bool has_pair = Grouped && routes.y >= 0;
+  const __half* xp_pair =
+      has_pair ? input + (routes.y / kTopK) * kHidden + group0 * kGroupSize
+               : nullptr;
 
-  half2 acc[4];
+  half2 acc[4], acc_pair[4];
 #pragma unroll
-  for (int p = 0; p < 4; ++p) acc[p] = __float2half2_rn(0.0f);
+  for (int p = 0; p < 4; ++p) {
+    acc[p] = __float2half2_rn(0.0f);
+    if constexpr (Grouped) acc_pair[p] = __float2half2_rn(0.0f);
+  }
 #pragma unroll
   for (int g = 0; g < kGroupsPerSplit1; ++g) {
     half2 sc[4];
-    {
-      const uint2 raw = *reinterpret_cast<const uint2*>(sp + g * kGateUp);
-      expand_scales8(raw.x, raw.y, sc);
-    }
-    uint32_t xr[8];
-    {
-      const uint4 a = __ldg(reinterpret_cast<const uint4*>(xp + g * 16));
-      const uint4 b = __ldg(reinterpret_cast<const uint4*>(xp + g * 16 + 8));
-      xr[0] = a.x; xr[1] = a.y; xr[2] = a.z; xr[3] = a.w;
-      xr[4] = b.x; xr[5] = b.y; xr[6] = b.z; xr[7] = b.w;
+    const uint2 raw = *reinterpret_cast<const uint2*>(sp + g * kGateUp);
+    expand_scales8(raw.x, raw.y, sc);
+    uint32_t xr[8], xr_pair[8];
+    load_words<4>(reinterpret_cast<const uint32_t*>(xp + g * kGroupSize),
+                  *reinterpret_cast<uint32_t (*)[4]>(xr));
+    load_words<4>(reinterpret_cast<const uint32_t*>(xp + g * kGroupSize + 8),
+                  *reinterpret_cast<uint32_t (*)[4]>(xr + 4));
+    if (has_pair) {
+      load_words<4>(reinterpret_cast<const uint32_t*>(xp_pair + g * kGroupSize),
+                    *reinterpret_cast<uint32_t (*)[4]>(xr_pair));
+      load_words<4>(reinterpret_cast<const uint32_t*>(xp_pair + g * kGroupSize + 8),
+                    *reinterpret_cast<uint32_t (*)[4]>(xr_pair + 4));
     }
 #pragma unroll
     for (int r = 0; r < kGroupSize; ++r) {
@@ -675,27 +628,35 @@ gate_up_fused_kernel(const __half* __restrict__ input,
       half2 v[4];
       dequant_fp4x8(w, v);
 #pragma unroll
-      for (int p = 0; p < 4; ++p)
-        acc[p] = __hfma2(x, __hmul2(sc[p], v[p]), acc[p]);
+      for (int p = 0; p < 4; ++p) {
+        const half2 w_scaled = __hmul2(sc[p], v[p]);
+        acc[p] = __hfma2(x, w_scaled, acc[p]);
+        if (has_pair) {
+          acc_pair[p] = __hfma2(broadcast_half(xr_pair, r), w_scaled, acc_pair[p]);
+        }
+      }
     }
   }
-  float* row = part_s + split * kStride + qword * 8;
+
+  const float global = global_scales[expert] * kMarlinScaleCompensation;
+  for (int i = 0; i < (has_pair ? 2 : 1); ++i) {
+    if (i != 0) __syncthreads();
+    float* row = part_s + split * kStride + qword * 8;
 #pragma unroll
-  for (int p = 0; p < 4; p += 2) {
-    float4 v;
-    v.x = __low2float(acc[p]);
-    v.y = __high2float(acc[p]);
-    v.z = __low2float(acc[p + 1]);
-    v.w = __high2float(acc[p + 1]);
-    *reinterpret_cast<float4*>(row + 2 * p) = v;
-  }
-  __syncthreads();
-  if (threadIdx.x < 64) {
-    float sum = 0.0f;
+    for (int p = 0; p < 4; p += 2) {
+      const half2 low = i == 0 ? acc[p] : acc_pair[p];
+      const half2 high = i == 0 ? acc[p + 1] : acc_pair[p + 1];
+      *reinterpret_cast<float4*>(row + 2 * p) = make_float4(
+          __low2float(low), __high2float(low), __low2float(high), __high2float(high));
+    }
+    __syncthreads();
+    if (threadIdx.x < 64) {
+      float sum = 0.0f;
 #pragma unroll
-    for (int s = 0; s < kSplitK; ++s) sum += part_s[s * kStride + threadIdx.x];
-    const float global = global_scales[expert] * kMarlinScaleCompensation;
-    pre_act[route * kGateUp + n_tile * 64 + threadIdx.x] = sum * global;
+      for (int k = 0; k < kSplitK; ++k) sum += part_s[k * kStride + threadIdx.x];
+      const int route = i == 0 ? routes.x : routes.y;
+      pre_act[route * kGateUp + n_tile * 64 + threadIdx.x] = sum * global;
+    }
   }
 }
 
@@ -887,8 +848,8 @@ void decode_legacy(torch::Tensor input, torch::Tensor w13, torch::Tensor w2,
             torch::Tensor down_partials, torch::Tensor output) {
   TORCH_CHECK(input.is_cuda() && input.scalar_type() == at::kHalf &&
                   input.dim() == 2 && input.size(0) >= 1 &&
-                  input.size(0) <= 4 && input.size(1) == kHidden,
-              "input must be CUDA FP16 [M, 2560], 1 <= M <= 4");
+                  input.size(0) <= vec::kMaxRows && input.size(1) == kHidden,
+              "input must be CUDA FP16 [M, 2560], 1 <= M <= 16");
   const int batch_size = static_cast<int>(input.size(0));
   const int num_routes = batch_size * kTopK;
   TORCH_CHECK(w13.is_cuda() && w13.scalar_type() == at::kInt,
@@ -964,11 +925,12 @@ void decode(torch::Tensor input, torch::Tensor w13, torch::Tensor w2,
             torch::Tensor w13_global, torch::Tensor w2_global,
             torch::Tensor topk_ids, torch::Tensor topk_weights,
             torch::Tensor gate_up_partials, torch::Tensor activated,
-            torch::Tensor down_partials, torch::Tensor output) {
+            torch::Tensor down_partials, torch::Tensor output,
+            torch::Tensor route_groups) {
   TORCH_CHECK(input.is_cuda() && input.scalar_type() == at::kHalf &&
                   input.dim() == 2 && input.size(0) >= 1 &&
-                  input.size(0) <= 4 && input.size(1) == kHidden,
-              "input must be CUDA FP16 [M, 2560], 1 <= M <= 4");
+                  input.size(0) <= vec::kMaxRows && input.size(1) == kHidden,
+              "input must be CUDA FP16 [M, 2560], 1 <= M <= 16");
   const int batch_size = static_cast<int>(input.size(0));
   const int num_routes = batch_size * kTopK;
   const bool legacy_scratch =
@@ -1024,18 +986,26 @@ void decode(torch::Tensor input, torch::Tensor w13, torch::Tensor w2,
   float* pre = gate_up_partials.data_ptr<float>();
   auto* out = reinterpret_cast<__half*>(output.data_ptr<at::Half>());
 
-  // Gate/up: CTA = (route, 64-column n_tile) x all 40 splits. From five rows
-  // on, CTAs visit routes in expert order so duplicate experts stream
-  // through L2 together; below that every CTA is resident at once anyway.
-  // The in-kernel expert sort keeps one route per thread for at most
-  // kMaxRoutes routes; unsorted routes would leave pre-activations unset.
-  TORCH_CHECK(num_routes <= vec::kMaxRoutes,
-              "fused MoE decode supports at most 32 rows");
-  const int k1_sorted = batch_size <= 4 ? 0 : 1;
-  vec::gate_up_fused_kernel<3>
-      <<<num_routes * vec::kNTiles, vec::kGateThreads, 0, stream>>>(
-          x, w13p, s13p, w13_global.data_ptr<float>(), ids, num_routes, pre,
-          k1_sorted);
+  // For verify batches, plan once and reuse each loaded weight/scale for
+  // both routes of a pair. The gate scratch and the fused down reduction
+  // retain the original per-token route order.
+  if (batch_size <= 4) {
+    vec::gate_up_fused_kernel<3>
+        <<<num_routes * vec::kNTiles, vec::kGateThreads, 0, stream>>>(
+            x, w13p, s13p, w13_global.data_ptr<float>(), ids, num_routes, pre,
+            nullptr);
+  } else {
+    TORCH_CHECK(route_groups.is_cuda() && route_groups.scalar_type() == at::kInt &&
+                    route_groups.numel() == 2 * (num_routes + 1),
+                "route_groups must contain one int32 pair per route and the count");
+    auto* groups = reinterpret_cast<int2*>(route_groups.data_ptr<int>());
+    vec::plan_gate_up_routes<<<1, vec::kPlanThreads, 0, stream>>>(ids, num_routes,
+                                                                  groups);
+    vec::gate_up_fused_kernel<2, true>
+        <<<num_routes * vec::kNTiles, vec::kGateThreads, 0, stream>>>(
+            x, w13p, s13p, w13_global.data_ptr<float>(), ids, num_routes, pre,
+            groups);
+  }
   // Down: CTA = (token, column tile) x all 10 routes x 5 splits. Tile-major
   // order keeps every token's CTA for one tile resident together.
   const float* g2 = w2_global.data_ptr<float>();

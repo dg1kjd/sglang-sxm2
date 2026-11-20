@@ -639,6 +639,7 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
+        group_queries: bool = False,
     ) -> torch.Tensor:
         # ordered_topk writes 0..length-1 for rows that fit k without reading their
         # scores, and never uses a score past a row's length.
@@ -654,6 +655,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
             min_scored_len=self.block_topk if use_fast_topk else 0,
+            group_queries=group_queries,
         )
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
@@ -901,6 +903,7 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                group_queries=is_target_verify or is_draft_extend,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
