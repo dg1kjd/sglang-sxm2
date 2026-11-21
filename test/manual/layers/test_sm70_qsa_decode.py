@@ -117,3 +117,94 @@ def test_e5m2_values_in_fp16_have_identical_attention():
         a = fn(q, k, v, table, req, indices, lens, 0.0625)
         b = fn(q, k.half(), v.half(), table, req, indices, lens, 0.0625)
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("page_size", [4, 16])
+def test_indexer_grouped_pages_match_independent_rows(page_size):
+    from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_decode
+    from sglang.srt.layers.attention.tilelang_fa_v100._decode_cuda import (
+        sm70_cuda_qsa_indexer_decode,
+    )
+
+    torch.manual_seed(210)
+    rows, pages = 9, 155
+    device = "cuda"
+    q = torch.randn(rows, 4, 128, device=device, dtype=torch.float16)
+    k = torch.randn(pages, page_size, 1, 128, device=device, dtype=torch.float16)
+    table = torch.randperm(pages, device=device, dtype=torch.int32).repeat(rows, 1)
+    table[2] = table[0].roll(3)  # different physical pages in the same CTA
+    table[3, -1] = table[3, 0]  # first pages shared, final page diverges
+    width = pages * page_size
+    lengths = torch.tensor(
+        [width, width - 1, width - 3, width, 0, 1, 512, 513, width - 2],
+        device=device,
+        dtype=torch.int32,
+    )
+    scale = 128**0.5
+
+    def run():
+        return sm70_cuda_qsa_indexer_decode(
+            q, k, table, lengths, width, scale, group_queries=True
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        grouped = run()
+    for i in range(2):
+        if i:
+            table.copy_(table.roll(9, dims=1))
+            lengths.copy_(lengths.roll(3))
+            q.normal_()
+        graph.replay()
+        valid = torch.arange(width, device=device)[None, :] < lengths[:, None]
+        separate = sm70_cuda_qsa_indexer_decode(q, k, table, lengths, width, scale)
+        ref = torch_qsa_mqa_decode(q, k, table, lengths, width, scale)
+        torch.testing.assert_close(grouped[valid], separate[valid], rtol=2e-5, atol=2e-5)
+        torch.testing.assert_close(grouped[valid], ref[valid], rtol=2e-5, atol=2e-5)
+
+        from sglang.kernels.ops.attention.ordered_topk import ordered_topk
+
+        short_rows_skipped = sm70_cuda_qsa_indexer_decode(
+            q, k, table, lengths, width, scale, group_queries=True, min_scored_len=512
+        )
+        assert torch.equal(
+            ordered_topk(short_rows_skipped, lengths, topk=512, row_starts=None),
+            ordered_topk(separate, lengths, topk=512, row_starts=None),
+        )
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e5m2, torch.float16])
+def test_decode_resolves_compressed_indices_in_selection_order(kv_dtype):
+    from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
+    from sglang.srt.layers.attention.tilelang_fa_v100._decode_cuda import (
+        sm70_cuda_qsa_decode,
+    )
+
+    torch.manual_seed(211)
+    device = "cuda"
+    pool = 12_000
+    lengths = torch.tensor(
+        [0, 1, 2, 3, 4, 31, 32, 33, 2047, 2048, 2049, 2051, 4098, 11003],
+        dtype=torch.int32,
+        device=device,
+    )
+    rows = lengths.numel()
+    q = torch.randn(rows, 6, 256, device=device, dtype=torch.float16)
+    k = torch.randn(pool, 1, 256, device=device).to(kv_dtype)
+    v = torch.randn_like(k.float()).to(kv_dtype)
+    table = torch.stack(
+        [torch.randperm(pool, device=device, dtype=torch.int32) for _ in range(3)]
+    )
+    reqs = torch.arange(rows, device=device, dtype=torch.int32) % 3
+    positions = lengths - 1
+    blocks = torch.full((rows, 512), -1, dtype=torch.int32, device=device)
+    for row, length in enumerate(lengths.tolist()):
+        count = length // 4
+        blocks[row, : min(count, 512)] = torch.randperm(count, device=device)[:512]
+    expanded = expand_qsa_block_indices(blocks, positions, lengths, 4, 2048)
+    expected = sm70_cuda_qsa_decode(q, k, v, table, reqs, expanded, lengths, 0.0625)
+    actual = sm70_cuda_qsa_decode(
+        q, k, v, table, reqs, blocks, lengths, 0.0625, query_positions=positions
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

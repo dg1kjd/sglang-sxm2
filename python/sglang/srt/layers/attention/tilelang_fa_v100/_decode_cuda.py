@@ -187,6 +187,8 @@ def sm70_cuda_qsa_decode(
     indices,
     seq_lens,
     softmax_scale,
+    *,
+    query_positions=None,
 ):
     """Run QSA split-KV decode directly from selected E5M2 or FP16 cache rows."""
     ext = _load_sm70_cuda_decode_ops()
@@ -202,6 +204,10 @@ def sm70_cuda_qsa_decode(
     )
     seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
     indices = indices.to(dtype=torch.int32).contiguous()
+    selected_tokens = indices.shape[1]
+    if query_positions is not None:
+        query_positions = query_positions.to(dtype=torch.int32).contiguous()
+        selected_tokens = selected_tokens * 4 + 3
     ext.sm70_qsa_decode(
         q.contiguous(),
         _qsa_cache_view(k_cache),
@@ -215,6 +221,7 @@ def sm70_cuda_qsa_decode(
         float(softmax_scale),
         partial_o,
         partial_lse,
+        query_positions,
     )
     if (
         1 <= batch <= 4
@@ -230,7 +237,7 @@ def sm70_cuda_qsa_decode(
             partial_o,
             partial_lse,
             seq_lens,
-            indices.shape[1],
+            selected_tokens,
             QSA_DECODE_TOKENS_PER_SPLIT,
         )
     from ._kernels_paged_decode import _decode_combine_kernel
@@ -242,7 +249,7 @@ def sm70_cuda_qsa_decode(
         max_splits,
         256,
         QSA_DECODE_TOKENS_PER_SPLIT,
-        selected_tokens=indices.shape[1],
+        selected_tokens=selected_tokens,
     )
     return combine(partial_o, partial_lse, seq_lens)
 
@@ -254,6 +261,9 @@ def sm70_cuda_qsa_indexer_decode(
     context_lens,
     max_model_len,
     score_scale,
+    *,
+    group_queries=False,
+    min_scored_len=0,
 ):
     """Score compressed QSA index keys without Volta MMA head padding."""
     ext = _load_sm70_cuda_decode_ops()
@@ -270,5 +280,7 @@ def sm70_cuda_qsa_indexer_decode(
         int(max_model_len),
         float(score_scale),
         logits,
+        group_queries,
+        min_scored_len,
     )
     return logits

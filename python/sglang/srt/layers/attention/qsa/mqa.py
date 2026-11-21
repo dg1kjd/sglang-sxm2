@@ -10,6 +10,7 @@ import math
 from typing import Optional
 
 import torch
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_capability
 
 
@@ -696,6 +697,7 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    group_queries: bool = False,
 ) -> torch.Tensor:
     if (
         q.is_cuda
@@ -705,7 +707,11 @@ def qsa_mqa_decode(
         and q.shape[1:] == (4, 128)
         and k_cache.dtype == torch.float16
         and k_cache.ndim == 4
-        and k_cache.shape[1:] == (4, 1, 128)
+        and (
+            k_cache.shape[1] == 4
+            or (k_cache.shape[1] == 16 and envs.SGLANG_SM70_QSA_GROUPED_DECODE.get())
+        )
+        and k_cache.shape[2:] == (1, 128)
     ):
         from sglang.srt.layers.attention.tilelang_fa_v100._decode_cuda import (
             sm70_cuda_qsa_indexer_decode,
@@ -718,6 +724,12 @@ def qsa_mqa_decode(
             context_lens,
             max_model_len,
             score_scale or math.sqrt(q.shape[-1]),
+            group_queries=(
+                group_queries
+                and q.shape[0] > 1
+                and envs.SGLANG_SM70_QSA_GROUPED_DECODE.get()
+            ),
+            min_scored_len=min_scored_len,
         )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
