@@ -1,9 +1,17 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from xgrammar import StructuralTag
+from xgrammar.structural_tag import (
+    GrammarFormat,
+    TagFormat,
+    TagsWithSeparatorFormat,
+    TriggeredTagsFormat,
+)
+
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -11,6 +19,13 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
+)
+from sglang.srt.function_call.glm4_moe_detector import (
+    _GLM_XML_GRAMMAR_RULES,
+    _glm_any_string_exclude,
+    _glm_escape_ebnf_string,
+    _glm_get_value_rule,
+    _glm_has_complete_properties,
 )
 from sglang.srt.function_call.utils import get_schema_properties
 
@@ -34,6 +49,37 @@ _HUNYUAN_TOKEN_RE = re.compile(
 )
 
 
+# id(tokenizer) -> (tokenizer, scan). The entry holds the tokenizer, so its id
+# is not reused while the entry exists.
+_vocab_scans: Dict[int, Tuple[Any, Optional[Dict[str, str]]]] = {}
+
+
+def _scan_hunyuan_vocab(tokenizer) -> Optional[Dict[str, str]]:
+    """``{name: token_str}`` for the Hunyuan tokens in the vocab, or None when
+    the vocab cannot be read. Both detectors are built for every request and
+    ``get_vocab()`` copies the whole vocab (~0.2 s for Hy4, on the HTTP event
+    loop), so each tokenizer is scanned once."""
+    entry = _vocab_scans.get(id(tokenizer))
+    if entry is not None and entry[0] is tokenizer:
+        return entry[1]
+    found = None
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception as e:
+        logger.warning("Failed to read Hunyuan tokenizer vocab: %s", e)
+        vocab = None
+    if isinstance(vocab, dict):
+        found = {}
+        for tok in vocab:
+            if not isinstance(tok, str):
+                continue
+            m = _HUNYUAN_TOKEN_RE.match(tok)
+            if m:
+                found[m.group("name")] = tok
+    _vocab_scans[id(tokenizer)] = (tokenizer, found)
+    return found
+
+
 def resolve_hunyuan_tokens(tokenizer) -> Dict[str, str]:
     """Map bare token names to their real (possibly suffixed) strings in vocab.
 
@@ -41,21 +87,8 @@ def resolve_hunyuan_tokens(tokenizer) -> Dict[str, str]:
     when the tokenizer carries no suffixed form, so the same detector serves
     both the preview (suffix-less) and shipping (suffixed) Hy3 tokenizers.
     """
-    tokens: Dict[str, str] = {}
-    vocab = None
-    if tokenizer is not None:
-        try:
-            vocab = tokenizer.get_vocab()
-        except Exception as e:
-            logger.warning("Failed to read Hunyuan tokenizer vocab: %s", e)
-            vocab = None
-    if isinstance(vocab, dict):
-        for tok in vocab:
-            if not isinstance(tok, str):
-                continue
-            m = _HUNYUAN_TOKEN_RE.match(tok)
-            if m:
-                tokens[m.group("name")] = tok
+    found = _scan_hunyuan_vocab(tokenizer) if tokenizer is not None else None
+    tokens: Dict[str, str] = dict(found or {})
     for name in _HUNYUAN_TOKEN_NAMES:
         tokens.setdefault(name, f"<{name}>")
     return tokens
@@ -106,16 +139,8 @@ class HunyuanDetector(BaseFormatDetector):
         # Hy4 dropped <tool_sep> from its vocab entirely; Hy3 carries it (bare
         # or suffixed). Detect the dialect from the vocab, not from the
         # resolved literal (which falls back to "<tool_sep>" for both).
-        self._has_tool_sep = True
-        if tokenizer is not None:
-            try:
-                self._has_tool_sep = any(
-                    re.fullmatch(r"<tool_sep(?::[^>]+)?>", tok)
-                    for tok in tokenizer.get_vocab()
-                    if isinstance(tok, str)
-                )
-            except Exception:
-                pass
+        found = _scan_hunyuan_vocab(tokenizer) if tokenizer is not None else None
+        self._has_tool_sep = found is None or "tool_sep" in found
 
         t = resolve_hunyuan_tokens(tokenizer)
         tool_calls = t["tool_calls"]
@@ -580,6 +605,112 @@ class HunyuanDetector(BaseFormatDetector):
 
     def supports_structural_tag(self) -> bool:
         return False
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> Optional[StructuralTag]:
+        # Hy4 only (the Hy3 dialect puts <tool_sep> and newlines between the
+        # parts). With thinking_mode the tag would also have to cover the
+        # reasoning; Hy4 serves with a reasoning parser, which owns it.
+        if self._has_tool_sep or thinking_mode or not tools:
+            return None
+        if isinstance(tool_choice, ToolChoice):
+            tools = [t for t in tools if t.function.name == tool_choice.function.name]
+            if not tools:
+                return None
+        calls = TagFormat(
+            begin=self.bot_token,
+            content=TagsWithSeparatorFormat(
+                tags=[
+                    TagFormat(
+                        begin=f"{self.tool_call_start_token}{tool.function.name}",
+                        content=GrammarFormat(
+                            grammar=self._arguments_grammar(tool.function.parameters)
+                        ),
+                        end=self.tool_call_end_token,
+                    )
+                    for tool in tools
+                ],
+                separator="",
+                at_least_one=True,
+                stop_after_first=not parallel_tool_calls,
+            ),
+            end=self.eot_token,
+        )
+        if tool_choice == "auto":
+            return StructuralTag(
+                format=TriggeredTagsFormat(
+                    triggers=[self.bot_token], tags=[calls], stop_after_first=True
+                )
+            )
+        return StructuralTag(format=calls)
+
+    def get_auto_tool_call_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> Optional[StructuralTag]:
+        # Free text and any number of calls need no grammar; only a one-call
+        # limit does.
+        if parallel_tool_calls:
+            return None
+        return self.get_structural_tag(
+            tools=tools,
+            tool_choice="auto",
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=False,
+        )
+
+    def _arguments_grammar(self, parameters: Optional[dict]) -> str:
+        """EBNF for the argument pairs of one call: the GLM-4.7 rules with Hy4's
+        tags. Keys come from the schema, in any order; values are typed for
+        enums and scalar types, free text otherwise."""
+        special_tokens = [
+            self.bot_token,
+            self.eot_token,
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+            self.arg_key_start_token,
+            self.arg_key_end_token,
+            self.arg_value_start_token,
+            self.arg_value_end_token,
+        ]
+        params = parameters or {}
+        properties = (
+            get_schema_properties(params) if _glm_has_complete_properties(params) else {}
+        )
+        composed = any(k in params for k in ("allOf", "anyOf", "oneOf"))
+
+        def pair(key_rule: str, value_rule: str) -> str:
+            return (
+                f'"{self.arg_key_start_token}" {key_rule} "{self.arg_key_end_token}" '
+                f'"{self.arg_value_start_token}" ({value_rule}) "{self.arg_value_end_token}"'
+            )
+
+        if properties:
+            choices = " | ".join(
+                pair(
+                    f'"{_glm_escape_ebnf_string(name)}"',
+                    "text_without_special_tokens"
+                    if composed
+                    else _glm_get_value_rule(schema),
+                )
+                for name, schema in properties.items()
+            )
+        else:
+            choices = pair("text_without_special_tokens", "text_without_special_tokens")
+        return "\n".join(
+            [
+                f"root ::= ( {choices} )*",
+                *_glm_any_string_exclude("text_without_special_tokens", special_tokens),
+                *_GLM_XML_GRAMMAR_RULES,
+            ]
+        )
 
     def parses_required_natively(self) -> bool:
         # Hy3/Hy4 both emit their structural tool-call format natively; without

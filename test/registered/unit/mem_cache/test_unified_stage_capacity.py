@@ -222,10 +222,14 @@ def _request_stage(
     )
     s.enable_session_radix_cache = False
     s.disaggregation_mode = DisaggregationMode.NULL
-    s.model_config = NS(hf_eos_token_id={1}, vocab_size=128)
+    s.model_config = NS(hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128)
     s.metrics_reporter = NS(enable_metrics=False)
     s.tokenizer = s.dllm_config = None
-    s.spec_algorithm = NS(is_dflash_family=lambda: False, is_uno=lambda: False)
+    s.spec_algorithm = NS(
+        is_dflash_family=lambda: False,
+        uses_block_verify=lambda: False,
+        is_uno=lambda: False,
+    )
     s._maybe_namespace_elastic_radix_cache = lambda req: None
     s._record_kv_event_lora_name = lambda req, name: None
     s.invariant_checker = NS(expect_output=lambda req: None)

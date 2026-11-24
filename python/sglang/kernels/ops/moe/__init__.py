@@ -29,6 +29,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.beam_decode_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.beam_decode_gemv:beam_decode_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.bf16_mega_gate",
         backend=KernelBackend.DEEPGEMM,
         target="sglang.kernels.ops.moe.mega_gate:bf16_mega_gate",
@@ -119,6 +130,20 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.ep_moe_kernels:compute_cutlass_w4a8_moe_input_scale",
         capabilities=CUDA_ONLY,
+    )
+)
+
+# SM70 Hunyuan-4-Flash routed experts at TP8: fp16 tokens, top-16, the SM70
+# Marlin NVFP4 packs read in place, clamped SwiGLU, routed scale; decode and
+# prefill with the same per-token bits.
+register_kernel(
+    KernelSpec(
+        op="moe.sm70_hy4_nvfp4_moe",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.sm70_hy4_nvfp4_moe:sm70_hy4_nvfp4_moe",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
     )
 )
 

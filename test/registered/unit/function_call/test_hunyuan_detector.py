@@ -4,7 +4,13 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
+from sglang.srt.function_call.hunyuan_detector import (
+    HunyuanDetector,
+    resolve_hunyuan_tokens,
+)
+from sglang.srt.parser.reasoning_parser import (
+    HunyuanDetector as HunyuanReasoningDetector,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -84,6 +90,38 @@ class _Hy4Tokenizer:
             "<arg_value:opensource>": 4,
             "<think:opensource>": 5,
         }
+
+
+class _CountingHy4Tokenizer(_Hy4Tokenizer):
+    def __init__(self):
+        self.get_vocab_calls = 0
+
+    def get_vocab(self):
+        self.get_vocab_calls += 1
+        return super().get_vocab()
+
+
+class TestHunyuanVocabScan(CustomTestCase):
+    def test_vocab_read_once_per_tokenizer(self):
+        # Serving builds both detectors for every request; get_vocab() copies
+        # the whole vocab (~0.2 s for Hy4), so it must run once per tokenizer.
+        tokenizer = _CountingHy4Tokenizer()
+        for _ in range(3):
+            detector = HunyuanDetector(tokenizer)
+            HunyuanReasoningDetector(tokenizer=tokenizer)
+        self.assertEqual(tokenizer.get_vocab_calls, 1)
+        self.assertEqual(detector.bot_token, "<tool_calls:opensource>")
+        self.assertFalse(detector._has_tool_sep)
+        self.assertEqual(resolve_hunyuan_tokens(tokenizer)["tool_sep"], "<tool_sep>")
+
+    def test_unreadable_vocab_falls_back_to_bare_tokens(self):
+        class _Broken:
+            def get_vocab(self):
+                raise RuntimeError("no vocab")
+
+        detector = HunyuanDetector(_Broken())
+        self.assertTrue(detector._has_tool_sep)
+        self.assertEqual(detector.bot_token, "<tool_calls>")
 
 
 class TestHunyuanDetectorHasToolCall(CustomTestCase):

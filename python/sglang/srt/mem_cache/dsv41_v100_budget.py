@@ -391,7 +391,7 @@ def allocate(
             if skip_dspark
             else "--language-model-only still skips ViT; DSpark is the draft worker, not a vision flag"
         ),
-        "Engram ~189 GiB lives on host when SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 (default on SM70)",
+        "Engram ~189 GiB lives on host with --engram-config placement cpu",
         f"routed-expert LRU spill {spill:.1f} GiB/rank; attention stays GPU",
         f"D4-G landing {int(landing_slots)} slots = {landing:.2f} GiB (relaunch104: 6 slots / 107.6 MiB)",
         "--cpu-offload-gb would page whole layers including CSA2/indexer: see tax in the spreadsheet",

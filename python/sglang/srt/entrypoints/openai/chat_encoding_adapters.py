@@ -416,6 +416,7 @@ def _build_inkling(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
         reasoning_parser=ctx.reasoning_parser,
         tool_call_parser=ctx.tool_call_parser,
         chat_hooks=ctx.chat_hooks,
+        spec=ctx.chat_encoding_spec,
     )
 
 
@@ -427,6 +428,12 @@ def _build_kimi_k3(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
     return KimiK3ChatEncodingAdapter(
         tokenizer=ctx.tokenizer, hf_config=ctx.hf_config, chat_hooks=ctx.chat_hooks
     )
+
+
+def _build_inkling2(ctx: ChatEncodingAdapterContext) -> Optional[ChatEncodingAdapter]:
+    if ctx.tokenizer is None:
+        return None  # --skip-tokenizer-init: the server encodes no chat prompts.
+    return _build_inkling(ctx)
 
 
 def _build_deepseek_recipe(
@@ -473,6 +480,7 @@ _BUILDERS: dict[
 ] = {
     "inkling": {"builtin": _build_inkling},
     "kimi_k3": {"builtin": _build_kimi_k3},
+    "inkling2": {"builtin": _build_inkling2},
     "dsv4": {"builtin": _build_deepseek_recipe},
     "dsv41": {"builtin": _build_deepseek_v41},
 }

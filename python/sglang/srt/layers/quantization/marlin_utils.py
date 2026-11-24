@@ -327,20 +327,63 @@ def check_marlin_supports_shape(
     return True, None
 
 
-def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
-    output_size_per_partition = (
-        getattr(layer, "output_size_per_partition", None) or layer.output_size
-    )
-    input_size_per_partition = (
-        getattr(layer, "input_size_per_partition", None) or layer.input_size
-    )
+def _resolve_layer_marlin_partition_sizes(layer: LinearBase) -> tuple[int, int]:
+    output_size_per_partition = getattr(layer, "output_size_per_partition", None)
+    input_size_per_partition = getattr(layer, "input_size_per_partition", None)
 
+    if output_size_per_partition is None or input_size_per_partition is None:
+        from sglang.srt.distributed.utils import get_group_rank_size
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        _, tp_size = get_group_rank_size(getattr(layer, "tp_group", None))
+
+        if output_size_per_partition is None:
+            if isinstance(layer, ColumnParallelLinear) and tp_size:
+                output_size_per_partition = layer.output_size // tp_size
+            else:
+                output_size_per_partition = layer.output_size
+
+        if input_size_per_partition is None:
+            if isinstance(layer, RowParallelLinear) and tp_size:
+                input_size_per_partition = layer.input_size // tp_size
+            else:
+                input_size_per_partition = layer.input_size
+
+    return output_size_per_partition, input_size_per_partition
+
+
+def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+    output_size_per_partition, input_size_per_partition = (
+        _resolve_layer_marlin_partition_sizes(layer)
+    )
     return check_marlin_supports_shape(
         output_size_per_partition=output_size_per_partition,
         input_size_per_partition=input_size_per_partition,
         input_size=layer.input_size,
         group_size=group_size,
     )[0]
+
+
+def verify_marlin_supports_layer(
+    layer: LinearBase, group_size: int, prefix: str = ""
+) -> None:
+    output_size_per_partition, input_size_per_partition = (
+        _resolve_layer_marlin_partition_sizes(layer)
+    )
+    try:
+        verify_marlin_supports_shape(
+            output_size_per_partition=output_size_per_partition,
+            input_size_per_partition=input_size_per_partition,
+            input_size=layer.input_size,
+            group_size=group_size,
+        )
+    except ValueError as e:
+        layer_desc = f"Layer '{prefix}'" if prefix else f"Layer {layer}"
+        raise ValueError(
+            f"{layer_desc} is quantized but incompatible with GPTQMarlin: {e} "
+            "If this layer is unquantized in the checkpoint, exclude it in "
+            "quantization_config.dynamic."
+        ) from e
 
 
 def check_moe_marlin_supports_layer(
@@ -658,7 +701,9 @@ def sm70_mxfp4_fused_decode_expert_limit() -> int | None:
 
 
 def sm70_nvfp4_marlin_process_scales(
-    scales: torch.Tensor, activation_dtype: torch.dtype
+    scales: torch.Tensor,
+    activation_dtype: torch.dtype,
+    column_multiplier: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, float]:
     """Encode logical E4M3 NVFP4 scales for the SM70 Marlin fast path.
 
@@ -666,6 +711,10 @@ def sm70_nvfp4_marlin_process_scales(
     bit operations.  It therefore consumes the special non-negative S0E5M3
     representation used by marlin_v100, not checkpoint-native S1E4M3 bytes.
     ``scales`` must already be in logical ``[E, K/16, N]`` order.
+
+    ``column_multiplier`` (``[E, 1, N]`` float32, values <= 1) is applied to
+    the logical scales before encoding, in FP16 where a power-of-two
+    multiple of an E4M3 value stays exact.
 
     Returns the encoded metadata and a power-of-two scale factor.  The caller
     must divide the processed global scale by that factor.
@@ -681,7 +730,10 @@ def sm70_nvfp4_marlin_process_scales(
             f"shape={tuple(scales.shape)}, dtype={scales.dtype}"
         )
 
-    logical = scales.to(torch.float16)
+    if column_multiplier is None:
+        logical = scales.to(torch.float16)
+    else:
+        logical = (scales.to(torch.float32) * column_multiplier).to(torch.float16)
     if bool((logical < 0).any()):
         raise ValueError("NVFP4 block scales must be non-negative")
 

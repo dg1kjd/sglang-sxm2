@@ -129,13 +129,6 @@ def test_fast_topk_negative_and_zero(topk):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
-def test_fast_topk_unsupported_k():
-    score = torch.randn(2, 4096, dtype=torch.float32, device="cuda")
-    lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
-    with pytest.raises(RuntimeError, match="topk"):
-        fast_topk(score, lengths, 1024)
-
-
 def _ordered_reference(score, lengths, topk, row_starts=None):
     """Stable order by (score descending, index ascending), cut at topk, then
     sorted by index; -1 past the row length."""

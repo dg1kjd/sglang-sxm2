@@ -2,7 +2,7 @@
 
 # sglang-sxm2
 
-*"You got any more of them chinese models?"-RELEASE*
+*"Because I am **not** a lawyer with 8x V100 and too much time on hand"-RELEASE*
 
 **An agentic-coding inference engine for N× V100-SXM2.**
 
@@ -20,6 +20,7 @@ SXM2 (NVLink) is only needed for speed. Any set of 32 GB V100s works, PCIe cards
 | **[GLM-5.3-Flash](docs/v100/GLM-5.3-Flash.md)**, 320B MoE, NVFP4, MTP | 8× V100 32 GB | 240k | **Agentic coding.** The primary model, with image and video input |
 | **[Qwen3.8-Flash-Next](docs/v100/Qwen3.8-Flash-Next.md)**, 125B MoE, NVFP4, MTP | 4× V100 32 GB | 262k | Coding and chat on four cards, image input, up to 3 parallel requests |
 | **[DeepSeek-V4.1-Flash](docs/v100/DeepSeek-V4.1-Flash.md)**, official MXFP8 + MXFP4, DSpark | 8× V100 32 GB, ~300 GiB host RAM | 256k | **Best reasoning and world knowledge** here. The full official checkpoint, for agentic coding where answer quality matters more than speed |
+| **[Hy4-flash](docs/v100/Hy4-flash.md)**, 220B MoE, NVFP4, DFly | 8× V100 32 GB | 262k | New. Fast tool-call turns over the full 262k context, image and video input. Still being evaluated against GLM-5.3-Flash |
 | **[MiniMax-H3](docs/v100/MiniMax-H3.md)**, video + audio | 4× V100 32 GB | 4–15 s clips | Text-to-video, keyframes, reference image/video/audio |
 | **[SenseNova-Loop-9B](docs/v100/SenseNova-Loop-9B.md)**, 9B looped, fp16 *(experimental)* | 4× V100 32 GB | 262k | Experimental. A small model with image input, 12 parallel requests per 4 GPUs, a second copy on GPUs 4–7 with `SENSENOVA_DP=2` |
 
@@ -65,6 +66,21 @@ DeepSeek-V4.1-Flash is the strongest model here for reasoning and world knowledg
 
 It is slow: about 11 tok/s on short code, about 7 on prose. The resident conversation is never re-prefilled, so a turn that adds a 700-token tool result reaches its first token in about 3 s.
 
+### Hy4-flash: fast tool-call turns over 262k (new)
+
+Tencent's 220B MoE with its built-in DFly drafter, over the full 262k context.
+
+| Conversation length | First turn (cold) | Each following tool-call turn |
+|---|---:|---:|
+| 32k tokens | 8 s | 0.24–0.27 s |
+| 128k tokens | 33 s | 0.30–0.36 s |
+| 190k tokens | 50 s | 0.37–0.38 s |
+
+- **Decode:** ~197 tok/s, with DFly accepting ~4.1 tokens per step.
+- **Images and video cost no context.** The vision tower runs from host memory. A 3840×2160 image takes ~2 s.
+- **Subagents don't evict the main session.** With a 190k main session, a fresh 19k subagent costs ~4.5 s once, and the next main turn answers in ~0.37 s.
+- **Accuracy:** GSM8K 97.5% (200 questions, sgl-eval, the model's recommended sampling).
+
 ### MiniMax-H3
 
 On 4 GPUs, a 5 s 960×544 clip takes 50 steps of 10–12 s each. A 5 s 1344×768 clip takes about 25 minutes.
@@ -89,8 +105,8 @@ A 9B model that runs layers 4–27 twice for each token. It runs in fp16 on 4 GP
 ## Requirements
 
 - **GPUs:** V100 with **32 GB**. SXM2 with NVLink is the measured setup. PCIe V100s run the same scripts, slower; GLM and Qwen need the interconnect switches under "PCIe V100s" on their pages.
-- **Host RAM:** GLM ~23 GB, up to ~29 GB with images. Qwen ~134 GB with the host KV tier, so plan for 160 GB. DeepSeek ~300 GiB (Engram on 1 GiB hugepages plus pinned expert spill). SenseNova ~15 GB. Each model page has the breakdown.
-- **Disk:** GLM 190 GB, Qwen 126 GB, DeepSeek 476 GB, SenseNova 18 GB, plus the H3 checkpoint.
+- **Host RAM:** GLM ~23 GB, up to ~29 GB with images. Hy4 ~38 GB, up to ~4 GB more with images. Qwen ~134 GB with the host KV tier, so plan for 160 GB. DeepSeek ~300 GiB (Engram on 1 GiB hugepages plus pinned expert spill). SenseNova ~15 GB. Each model page has the breakdown.
+- **Disk:** GLM 190 GB, Hy4 151 GB, Qwen 126 GB, DeepSeek 476 GB, SenseNova 18 GB, plus the H3 checkpoint.
 - **CUDA 12.8 or 12.9.** CUDA 13 dropped Volta.
 - **GCC ≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, which many distros now default to.
 - **Python 3.12**, Linux. `ffmpeg` and `ffprobe` for MiniMax-H3.
@@ -117,15 +133,17 @@ Run the smoke check. A server that is missing the Volta kernels still starts and
 The image builds the same stack from source. No pre-built image is published. You need Docker with the NVIDIA Container Toolkit and a host driver from the R570 series or newer (the image uses CUDA 12.8).
 
 ```bash
-docker compose -f docker/v100-compose.yaml build glm53  # about an hour; one image for all four
-docker compose -f docker/v100-compose.yaml up glm53     # or qwen38, dsv41, h3
+docker compose -f docker/v100-compose.yaml build glm53  # about an hour; one image for all models
+docker compose -f docker/v100-compose.yaml up glm53     # or hy4, qwen38, dsv41, h3
 ```
 
 Checkpoints are read from `MODELS_DIR` (default `~/models`) under the directory names used in [Run](#run). DeepSeek-V4.1-Flash still needs the 1 GiB hugepages reserved on the host. [INSTALL.md](docs/v100/INSTALL.md#docker) has the details.
 
 ## Run
 
-One language model at a time. All four bind `0.0.0.0:11435` (`SGLANG_V100_HOST`, `SGLANG_V100_PORT`). The first launch compiles JIT kernels for several minutes.
+**Upgrading: the server now refuses to start while a removed environment variable is set, and names the replacement. Old DeepSeek-V4.1 setups hit this with `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE`, `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` or `SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS` (now `--engram-config`, which the script passes) and `SGLANG_ENABLE_DSV41_REQUEST_WINDOW` (now `--enable-encoder-swa-bounded-replay`). Unset them, also in a systemd env file or your own launch script.**
+
+One language model at a time. All of them bind `0.0.0.0:11435` (`SGLANG_V100_HOST`, `SGLANG_V100_PORT`). The first launch compiles JIT kernels for several minutes.
 
 ```bash
 pip install -U "huggingface_hub[cli]"
@@ -133,6 +151,11 @@ pip install -U "huggingface_hub[cli]"
 # GLM-5.3-Flash, 8 GPUs
 hf download RadixArk/GLM-5.3-Flash-NVFP4 --local-dir ~/models/GLM-5.3-Flash-NVFP4
 GLM53_MODEL=~/models/GLM-5.3-Flash-NVFP4 bash scripts/serve_glm53_flash_nvfp4_v100.sh
+
+# Hy4-flash, 8 GPUs, DFly on
+hf download Avifenesh/Hy4-flash-NVFP4 --revision f9eac06cf022cfd3dc2e8ed423922466b2adcd87 \
+  --local-dir ~/models/Hy4-flash-NVFP4
+HY4_MODEL=~/models/Hy4-flash-NVFP4 bash scripts/serve_hy4_flash_nvfp4_v100.sh
 
 # Qwen3.8-Flash-Next, 4 GPUs, MTP on
 hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 --local-dir ~/models/Qwen3.8-Flash-Next-NVFP4
@@ -178,10 +201,10 @@ These models reason before they answer. An empty `content` with a large `complet
 
 ## Limitations
 
-- **One agent session per server** for GLM and DeepSeek (`--max-running-requests 1`). Further requests queue. Qwen takes up to three streams.
+- **One agent session per server** for GLM, Hy4 and DeepSeek (`--max-running-requests 1`). Further requests queue. Qwen takes up to three streams.
 - **DeepSeek-V4.1-Flash keeps one conversation resident** (the last four on disk). A new conversation prefills from scratch, and a long uncached suffix runs at about 300 tok/s.
 - **GLM: the first tool turn after a cold 190k prompt takes ~1.15 s** (the next ones 0.64–0.70 s). Not found yet.
-- **Not soaked for days.** DeepSeek carried a multi-hour Claude Code session and Qwen an hour of mixed load. GLM has no multi-hour soak yet.
+- **Not soaked for days.** DeepSeek carried a multi-hour Claude Code session and Qwen an hour of mixed load. GLM and Hy4 have no multi-hour soak yet.
 - **SenseNova-Loop-9B is experimental.** It passed short checks (gsm8k, a 245k needle, tool calls, images, thinking on and off) but has not carried a long session.
 - **Volta has no bf16 and no FP4/FP8 hardware.** Everything runs as fp16 with weight-only 4/8-bit kernels, so numerics differ slightly from a Hopper run of the same checkpoint.
 

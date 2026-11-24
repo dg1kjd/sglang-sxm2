@@ -5,6 +5,7 @@
 #   docker compose -f docker/v100-compose.yaml up glm53
 #   docker compose -f docker/v100-compose.yaml up qwen38
 #   docker compose -f docker/v100-compose.yaml up dsv41
+#   docker compose -f docker/v100-compose.yaml up hy4
 #   docker compose -f docker/v100-compose.yaml up h3
 #
 # Checkpoints are read from MODELS_DIR (default ~/models), one directory per
@@ -77,6 +78,15 @@ services:
       SGLANG_DSV41_ENGRAM_NUMA_NODE:
       SGLANG_DSV41_EXPERT_SPILL_NUMA_NODES:
       SGLANG_DSV41_CSA2_SESSION_DIR: /root/.cache/csa2-sessions
+
+  hy4:
+    <<: *v100
+    profiles: [hy4]
+    command: [hy4]
+    environment:
+      <<: *env
+      HY4_MODEL: /models/Hy4-flash-NVFP4
+      HY4_GPUS: ${HY4_GPUS:-0,1,2,3,4,5,6,7}
 
   h3:
     <<: *v100

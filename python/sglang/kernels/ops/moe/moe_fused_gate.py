@@ -371,6 +371,7 @@ def moe_fused_gate(
             return sm70_router_topk.sm70_router_topk(
                 scores,
                 bias,
+                topk,
                 renormalize,
                 routed_scaling_factor,
                 apply_routed_scaling_factor_on_output,

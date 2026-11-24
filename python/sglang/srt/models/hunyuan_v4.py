@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.gemm.sm70_fixed_order_gemm import MAX_ROWS
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.layer_boundary import (
     IHCState,
@@ -312,7 +314,7 @@ class HYV4HCHeadLayer(nn.Module):
         scale = torch.rsqrt(
             flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps
         )
-        gates = self.hc_head_fn(flat)[0] * scale
+        gates = self._gates(flat) * scale
         gates = (
             torch.sigmoid(gates * self.hc_head_scale + self.hc_head_base)
             + self.config.hc_eps
@@ -320,6 +322,16 @@ class HYV4HCHeadLayer(nn.Module):
         output = torch.sum(gates.unsqueeze(-1) * flat.reshape(shape), dim=1)
         output = output.to(hidden_states.dtype)
         return output if norm is None else norm(output)
+
+
+    def _gates(self, flat: torch.Tensor) -> torch.Tensor:
+        # cuBLAS picks its fp32 kernel and split-K by M, so a row's gates would
+        # change with the batch (the DFly verify step's 6 rows against decode's
+        # one). Per-row sums of the elementwise products do not, and are as fast
+        # at these sizes; their [M, hc_mult, K] temporary keeps them to small M.
+        if flat.shape[0] <= MAX_ROWS and envs.SGLANG_USE_SM70_FIXED_ORDER_GEMM.get():
+            return (flat.unsqueeze(1) * self.hc_head_fn.weight).sum(-1)
+        return self.hc_head_fn(flat)[0]
 
 
 class HYV4Attention(DeepseekV2AttentionMLA):

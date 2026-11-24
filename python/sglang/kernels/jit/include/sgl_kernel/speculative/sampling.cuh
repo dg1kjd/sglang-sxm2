@@ -134,8 +134,10 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   DType u = coin * sum_relu_q_minus_p;
 
   DType aggregate_relu_q_minus_p(0);
+#ifndef USE_MUSA
   // Each thread's fallback candidate; FlashInfer reduces it only if the scan selects nothing.
   int last_valid_index = -1;
+#endif
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(DType(0));
     p_vec.fill(DType(0));

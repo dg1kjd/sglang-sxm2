@@ -27,6 +27,7 @@ logger = init_logger(__name__)
 
 class AttentionBackendEnum(enum.Enum):
     FA2 = enum.auto()
+    FLASHINFER_FA2 = enum.auto()
     FA = enum.auto()
     TILELANG_FA_V100 = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
@@ -47,6 +48,7 @@ class AttentionBackendEnum(enum.Enum):
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     LASER_ATTN = enum.auto()
+    ASCEND_SPARSE_ATTN = enum.auto()
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
     SOL_ATTN = enum.auto()
@@ -74,6 +76,7 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.LASER_ATTN,
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.ASCEND_SPARSE_ATTN,
             AttentionBackendEnum.SOL_ATTN,
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
             AttentionBackendEnum.CUBE_SPARSE_ATTN,

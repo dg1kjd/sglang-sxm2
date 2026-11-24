@@ -24,7 +24,22 @@ _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
+_SM70 = frozenset({CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
+
+for _name, _backend in (
+    ("linear_bf16_quack", KernelBackend.CUTE_DSL),
+    ("linear_bf16_cublaslt", KernelBackend.FLASHINFER),
+):
+    register_kernel(
+        KernelSpec(
+            op="gemm.linear_bf16",
+            backend=_backend,
+            target=f"sglang.kernels.ops.gemm.sm120_bf16:{_name}",
+            capabilities=_SM120,
+        )
+    )
+del _name, _backend
 
 
 for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
@@ -536,6 +551,13 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.int8_scaled_mm_via_int_mm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.int8_kernel:int8_scaled_mm_via_int_mm",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.muse_spark_router_gemv",
         backend=KernelBackend.CUTE_DSL,
         target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
@@ -597,6 +619,14 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
 del _mod, _fn, _desc
 register_kernel(
     KernelSpec(
+        op="gemm.project_active_codebook_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.codebook_projection:project_active_codebook_logits",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.hopper_fp8_block_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_fp8_block_gemv:hopper_fp8_block_gemv",
@@ -619,3 +649,13 @@ register_kernel(
         capabilities=_SM90,
     )
 )
+for _name in ("linear", "fp8_linear", "bmm"):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.sm70_fixed_order_{_name}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.gemm.sm70_fixed_order_gemm:{_name}",
+            capabilities=_SM70,
+        )
+    )
+del _name

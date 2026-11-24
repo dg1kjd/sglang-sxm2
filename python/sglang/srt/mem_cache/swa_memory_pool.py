@@ -193,6 +193,11 @@ class SWAKVPool(BaseSWAKVPool):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
+    @property
+    def index_page_size(self) -> int:
+        """Slots per index-key page; only a DSA full sub-pool keeps index keys."""
+        return self.full_kv_pool.index_page_size
+
     def register_layer_transfer_counter(self, layer_transfer_counter):
         # Wait happens at this wrapper. Inner pools must not wait again.
         self.layer_transfer_counter = layer_transfer_counter

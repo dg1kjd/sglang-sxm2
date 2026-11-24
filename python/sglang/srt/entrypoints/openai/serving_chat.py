@@ -125,6 +125,7 @@ from sglang.srt.parser.jinja_template_utils import (
 )
 from sglang.srt.parser.python_chat_template import render_chat_segments
 from sglang.srt.parser.reasoning_parser import (
+    HunyuanDetector,
     IQuestQ1ReasoningDetector,
     ReasoningParser,
 )
@@ -1074,6 +1075,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 return encoding_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
+        if request.return_flat_raw_sampling_mask and not request.return_meta_info:
+            return "return_flat_raw_sampling_mask requires return_meta_info=true."
 
         media_error = self._validate_media_content(request)
         if media_error:
@@ -1337,6 +1340,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return_flat_raw_top_logprobs_b64=(
                 request.return_flat_raw_output_top_logprobs
                 and request.return_flat_raw_top_logprobs_b64
+            ),
+            return_flat_raw_sampling_mask=request.return_flat_raw_sampling_mask,
+            return_flat_raw_sampling_mask_b64=(
+                request.return_flat_raw_sampling_mask
+                and request.return_flat_raw_sampling_mask_b64
             ),
             modalities=processed_messages.modalities,
             lora_path=lora_path,
@@ -3486,8 +3494,13 @@ class OpenAIServingChat(OpenAIServingBase):
         rather than via :meth:`wrap_reasoning_history`; see
         :func:`chat_encoding.spec_owns_reasoning_history` for why.
         """
+        # Hunyuan templates put the think block around content themselves; wrapped
+        # history would follow an empty think block the template adds.
         return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec) or (
-            isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
+            isinstance(
+                self._reasoning_detector,
+                (ResponseTemplateReasoningDetector, HunyuanDetector),
+            )
             and self.template_manager.chat_template_name is None
             and self._template_reads_reasoning_content
         )

@@ -9,7 +9,10 @@ from typing import Optional
 
 import torch
 from torch.nn.parameter import Parameter
+
+from sglang.kernels.ops.gemm import sm70_fixed_order_gemm
 from sglang.kernels.sm70_paths import sm70_csrc, sm70_jit_build_dir, sm70_prebuilt
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +317,27 @@ def prepare_sm70_turbomind_fp8_linear(layer: torch.nn.Module) -> None:
     if getattr(layer, "weight_block_size", None) != [128, 128]:
         raise RuntimeError("SM70 TurboMind FP8 requires weight_block_size=[128, 128].")
 
+    layer.sm70_fp8_fixed_order = (
+        envs.SGLANG_USE_SM70_FIXED_ORDER_GEMM.get()
+        and layer.weight.dtype == torch.float8_e4m3fn
+        and sm70_fixed_order_gemm.rows_aligned(layer.weight.data)
+        and layer.weight.shape[0] % 8 == 0
+        and layer.weight.shape[1] % 128 == 0
+    )
+    if layer.sm70_fp8_fixed_order:
+        # The checkpoint layout: e4m3 [N, K] and fp32 [ceil(N/128), K/128] scales.
+        # Unlike the fp16 callers, apply takes the kernel at every M: TurboMind
+        # for large M would need its own repacked copy of the weight, and at
+        # M = 2048 this kernel is about as fast as TurboMind on these layers.
+        layer.weight_scale_inv = Parameter(
+            layer.weight_scale_inv.data.to(torch.float32).contiguous(),
+            requires_grad=False,
+        )
+        layer.sm70_fp8_turbomind = False
+        layer.sm70_fp8_gated_silu = False
+        logger.info_once("SM70 (V100): using the fixed-order block-FP8 GEMM.")
+        return
+
     # QPN8 decode codes must be captured from the raw checkpoint weight before
     # the TurboMind repack replaces it.
     _maybe_prepare_sm70_fp8_qpn8(layer)
@@ -370,6 +394,16 @@ def apply_sm70_turbomind_fp8_linear(
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
     x_2d = x.reshape(-1, x.shape[-1])
+    if layer.sm70_fp8_fixed_order:
+        if not sm70_fixed_order_gemm.rows_aligned(x_2d):
+            x_2d = x_2d.clone(memory_format=torch.contiguous_format)
+        fused_bias = bias is not None and bias.dtype == torch.float16
+        out_2d = sm70_fixed_order_gemm.fp8_linear(
+            x_2d, layer.weight, layer.weight_scale_inv, bias if fused_bias else None
+        )
+        if bias is not None and not fused_bias:
+            out_2d.add_(bias)
+        return out_2d.reshape(*x.shape[:-1], layer.output_size_per_partition)
     if x_2d.stride(-1) != 1:
         x_2d = x_2d.contiguous()
     k, n = (

@@ -195,6 +195,73 @@ def fused_experts_none_to_marlin(
             )
             return StandardCombineInput(hidden_states=output)
 
+    # Hunyuan-4-Flash at TP8: routed latent 1536, top-16, I=192 per rank. For
+    # decode Marlin's padded grouped GEMM is far above the weight stream; read
+    # the same Marlin NVFP4 packs with per-expert HMMA kernels. Prefill runs
+    # there too, so a token gets the same bits in prefill and decode.
+    if (
+        hidden_states.ndim == 2
+        and hidden_states.shape[1] == 1536
+        and topk_output.topk_ids.shape[-1] == 16
+        and quant_info.weight_bits == 4
+        and quant_info.w13_qzeros is None
+        and quant_info.w2_qzeros is None
+        and quant_info.w13_bias is None
+        and quant_info.w2_bias is None
+        and quant_info.w13_g_idx is None
+        and quant_info.w2_g_idx is None
+        and quant_info.expert_map is None
+        and runner_config.num_experts == runner_config.num_local_experts
+        and runner_config.activation == "silu"
+        and runner_config.is_gated
+        and not runner_config.apply_router_weight_on_input
+        and not runner_config.no_combine
+        and runner_config.gemm1_alpha is None
+        and runner_config.gemm1_beta is None
+        and runner_config.gemm1_clamp_limit is None
+        and runner_config.gate_up_input_scale == 1.0
+        and runner_config.wide_output_scale == 1.0
+    ):
+        from sglang.kernels.ops.moe.sm70_hy4_nvfp4_moe import (
+            sm70_hy4_nvfp4_moe,
+            sm70_hy4_nvfp4_moe_available,
+            sm70_hy4_nvfp4_moe_eligible,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.layers import zero_copy_context
+
+        if (
+            envs.SGLANG_ENABLE_SM70_HY4_MOE.get()
+            and sm70_hy4_nvfp4_moe_available()
+            and sm70_hy4_nvfp4_moe_eligible(
+                hidden_states,
+                quant_info.w13_qweight,
+                quant_info.w2_qweight,
+                quant_info.w13_scales,
+                quant_info.w2_scales,
+                quant_info.w13_global_scale,
+                quant_info.w2_global_scale,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                runner_config.swiglu_limit,
+            )
+        ):
+            output = sm70_hy4_nvfp4_moe(
+                hidden_states,
+                quant_info.w13_qweight,
+                quant_info.w2_qweight,
+                quant_info.w13_scales,
+                quant_info.w2_scales,
+                quant_info.w13_global_scale,
+                quant_info.w2_global_scale,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                runner_config.swiglu_limit,
+                routed_scale,
+                out=zero_copy_context.get_moe_output(hidden_states),
+            )
+            return StandardCombineInput(hidden_states=output)
+
     # GLM-5.3-Flash: hidden 4096, top-8; EP or TP-sliced experts. Load replaced
     # the Marlin expert pack with the lane-major HMMA pack (same bytes). Decode
     # reads that pack. Prefill unpacks it back into the shared scratch so

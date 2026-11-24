@@ -856,12 +856,12 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.server_args.tool_call_parser = "auto"
         self.tm.server_args.reasoning_parser = "auto"
         self.tm._config_overrides.update(
-            {"tool_call_parser": "qwen25", "reasoning_parser": None}
+            {"tool_call_parser": "qwen", "reasoning_parser": None}
         )
 
         chat = OpenAIServingChat(self.tm, self.template_manager)
 
-        self.assertEqual(chat.tool_call_parser, "qwen25")
+        self.assertEqual(chat.tool_call_parser, "qwen")
         self.assertIsNone(chat.reasoning_parser)
         self.assertEqual(self.tm.server_args.tool_call_parser, "auto")
 
@@ -1990,6 +1990,53 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(adapted.top_logprobs_num, 2)
                 self.assertEqual(adapted.return_flat_raw_output_top_logprobs, flat)
                 self.assertEqual(adapted.return_flat_raw_top_logprobs_b64, b64)
+
+    def test_validate_request_rejects_flat_sampling_mask_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_flat_raw_sampling_mask=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_flat_raw_sampling_mask requires return_meta_info=true.",
+        )
+
+    def test_convert_to_internal_request_flat_sampling_mask_default_to_b64(self):
+        self.tm.tokenizer = None
+        # (request flags, expected flat mask, expected b64)
+        cases = (
+            ({"return_flat_raw_sampling_mask": True}, True, True),
+            (
+                {
+                    "return_flat_raw_sampling_mask": True,
+                    "return_flat_raw_sampling_mask_b64": False,
+                },
+                True,
+                False,
+            ),
+            ({}, False, False),
+        )
+        for flags, flat, b64 in cases:
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                input_ids=[101, 102, 103],
+                return_sampling_mask=True,
+                return_meta_info=True,
+                **flags,
+            )
+            with self.subTest(flags=flags):
+                adapted, _ = self.chat._convert_to_internal_request(
+                    req, self.fastapi_request
+                )
+                # The b64 default must not trip GenerateReqInput validation.
+                adapted.normalize_batch_and_arguments()
+
+                self.assertTrue(adapted.return_sampling_mask)
+                self.assertEqual(adapted.return_flat_raw_sampling_mask, flat)
+                self.assertEqual(adapted.return_flat_raw_sampling_mask_b64, b64)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -3940,7 +3987,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
         """Parsers without a structural tag keep the JSON array fallback, but a
         non-array payload degrades instead of raising an opaque TypeError."""
-        self.chat.tool_call_parser = "glm45"
+        self.chat.tool_call_parser = "glm"
         tools = [
             {
                 "type": "function",
@@ -4259,6 +4306,62 @@ class ServingChatTestCase(CustomTestCase):
                 else:
                     self.assertIsNone(assistant.reasoning_content)
                     self.assertIn("Consider the question.", assistant.content[0].text)
+
+    def test_hunyuan_messages_thinking_replay(self):
+        """Hunyuan templates frame the think block around content themselves.
+
+        Wrapping the history into content would render an empty think block
+        from the template followed by the wrapped one.
+        """
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+        from sglang.srt.parser.reasoning_parser import HunyuanDetector
+
+        request = AnthropicMessagesRequest(
+            model="x",
+            max_tokens=32,
+            messages=[
+                {"role": "user", "content": "List the files."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "I should run ls."},
+                        {"type": "text", "text": "Running it."},
+                        {
+                            "type": "tool_use",
+                            "id": "c0",
+                            "name": "bash",
+                            "input": {"command": "ls"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "c0", "content": "a.py"}
+                    ],
+                },
+            ],
+        )
+        reads = "{{ messages[1].reasoning_content }}"
+        for template, native in ((reads, True), ("{{ messages[1].content }}", False)):
+            with self.subTest(native=native):
+                self.tm.tokenizer.chat_template = template
+                self.template_manager.chat_template_name = None
+                chat = OpenAIServingChat(self.tm, self.template_manager)
+                chat.chat_encoding_spec = None
+                chat._reasoning_detector = HunyuanDetector()
+                converted = AnthropicServing(chat)._convert_to_chat_completion_request(
+                    request
+                )
+                assistant = converted.messages[1]
+                if native:
+                    self.assertEqual(assistant.reasoning_content, "I should run ls.")
+                    self.assertEqual(assistant.content, "Running it.")
+                    self.assertEqual(assistant.tool_calls[0].function.name, "bash")
+                else:
+                    self.assertIsNone(assistant.reasoning_content)
+                    self.assertIn("<think>I should run ls.", assistant.content[0].text)
 
     # ------------- dsv4 task -------------
     def test_dsv4_task_field_schema(self):
@@ -6374,7 +6477,7 @@ class TestUsageReasoningTokens(CustomTestCase):
         no_reasoning = UsageProcessor.calculate_token_usage(
             prompt_tokens=5, completion_tokens=7
         )
-        self.assertIsNone(no_reasoning.completion_tokens_details)
+        self.assertEqual(no_reasoning.completion_tokens_details.reasoning_tokens, 0)
 
 
 class TestShouldIncludeUsage(CustomTestCase):

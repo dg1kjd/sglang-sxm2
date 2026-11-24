@@ -68,6 +68,15 @@ class DetectionRule:
 # out-think high.
 GLM53_EFFORT_ALIASES = (("minimal", "low"), ("medium", "high"))
 
+# Hy4-flash knows no_think / high / max (Hy4-preview: no_think / low / high) and
+# raises on any other level.
+HY4_FLASH_EFFORT_ALIASES = (
+    ("minimal", "high"),
+    ("low", "high"),
+    ("xhigh", "max"),
+    ("max", "max"),
+)
+
 
 @dataclass(frozen=True)
 class ReasoningToggleConfig:
@@ -192,6 +201,19 @@ REASONING_MODE_RULES = (
         value=ReasoningToggleConfig(special_case="mistral"),
         predicate=lambda ctx: (
             ctx.has_text("reasoning_effort") and ctx.has_text("[THINK]")
+        ),
+    ),
+    DetectionRule(
+        name="hy4_flash_reasoning_effort",
+        value=ReasoningToggleConfig(
+            special_case="hunyuan_effort", effort_aliases=HY4_FLASH_EFFORT_ALIASES
+        ),
+        predicate=lambda ctx: (
+            ctx.has_text("reasoning_effort")
+            and ctx.has_text("reasoning_mode_token")
+            and ctx.has_text("no_think")
+            and ctx.has_text("'max'")
+            and not ctx.has_text("'low'")
         ),
     ),
     DetectionRule(
@@ -433,8 +455,8 @@ def _is_hunyuan(ctx):
         (tc and sep)
         or (
             tc
-            and ctx.reasoning_config
-            == ReasoningToggleConfig(special_case="hunyuan_effort")
+            and ctx.reasoning_config is not None
+            and ctx.reasoning_config.special_case == "hunyuan_effort"
             and ctx.has_vocab_pattern(r"^<arg_key(?::[^>]+)?>$")
             and ctx.has_vocab_pattern(r"^<arg_value(?::[^>]+)?>$")
         )
@@ -485,9 +507,7 @@ def _is_minicpm5(ctx):
 
 
 def _is_lfm2(ctx):
-    return (
-        ctx.has_text("<|tool_call_start|>") or ctx.has_vocab("<|tool_call_start|>")
-    ) and (ctx.has_text("<|tool_call_end|>") or ctx.has_vocab("<|tool_call_end|>"))
+    return ctx.has_text("<|tool_call_start|>") and ctx.has_text("<|tool_call_end|>")
 
 
 def _is_step3p5(ctx):
@@ -616,17 +636,20 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
+    DetectionRule(name="glm45", value="glm", predicate=_is_glm_family),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
     DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
-    DetectionRule(
-        name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
-    ),
+    DetectionRule(name="xml_kv_tool_call", value="glm", predicate=_is_xml_kv_tool_call),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
+    DetectionRule(
+        name="granite_toolcall_parser",
+        value="granite_toolcall_parser",
+        predicate=lambda ctx: _is_granite_thinking_parser(ctx) and _is_qwen3_coder(ctx),
+    ),
     DetectionRule(name="qwen3_coder", value="qwen3_coder", predicate=_is_qwen3_coder),
     DetectionRule(name="qwen", value="qwen", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v3", value="deepseekv3", predicate=_is_deepseek_v3),

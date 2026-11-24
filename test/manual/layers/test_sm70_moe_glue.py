@@ -71,9 +71,9 @@ def router_case(name, x, w, bias):
     err_c = (cublas.double() - ref64).abs()
     scale = ref64.abs().amax(-1, keepdim=True).clamp_min(1e-30)
     ok_det = torch.equal(got.view(torch.int32), again.view(torch.int32))
-    _, ids_k = sm70_router_topk(got, bias, True, 2.5, False)
-    _, ids_c = sm70_router_topk(cublas, bias, True, 2.5, False)
-    _, ids_r = sm70_router_topk(ref64.float(), bias, True, 2.5, False)
+    _, ids_k = sm70_router_topk(got, bias, 8, True, 2.5, False)
+    _, ids_c = sm70_router_topk(cublas, bias, 8, True, 2.5, False)
+    _, ids_r = sm70_router_topk(ref64.float(), bias, 8, True, 2.5, False)
     ids_k, ids_c, ids_r = ids_k.sort(-1)[0], ids_c.sort(-1)[0], ids_r.sort(-1)[0]
     print(
         f"logits {name:34s} max|err|/max|y| kernel {float((err_k / scale).max()):.2e} cublas {float((err_c / scale).max()):.2e}"
@@ -115,9 +115,9 @@ def test_router(ckpt: str | None) -> bool:
                 outs_c.append(torch.mm(x.float(), w.float().t()))
             got, cub = torch.cat(outs_k), torch.cat(outs_c)
             ref64 = xs.reshape(-1, w.size(1)).double() @ w.double().t()
-            _, ik = sm70_router_topk(got, bias, True, 2.5, False)
-            _, ic = sm70_router_topk(cub, bias, True, 2.5, False)
-            _, ir = sm70_router_topk(ref64.float(), bias, True, 2.5, False)
+            _, ik = sm70_router_topk(got, bias, 8, True, 2.5, False)
+            _, ic = sm70_router_topk(cub, bias, 8, True, 2.5, False)
+            _, ir = sm70_router_topk(ref64.float(), bias, 8, True, 2.5, False)
             ik, ic, ir = ik.sort(-1)[0], ic.sort(-1)[0], ir.sort(-1)[0]
             ek = (got.double() - ref64).abs().mean()
             ec = (cub.double() - ref64).abs().mean()

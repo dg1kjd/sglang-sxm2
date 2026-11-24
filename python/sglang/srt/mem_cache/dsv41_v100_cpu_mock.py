@@ -339,7 +339,7 @@ def check_serve_script(lines: List[str], repo_root: Optional[str] = None) -> Opt
         "SGLANG_DSV41_MEM_FRACTION:-0.99",
         "--chunked-prefill-size 2048",
         "--disable-custom-all-reduce",
-        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
+        "--engram-config",
         "SGLANG_DSV41_EXPERT_SPILL_GB",
         "SGLANG_DSV41_EXPERT_SPILL_APPLY",
     )

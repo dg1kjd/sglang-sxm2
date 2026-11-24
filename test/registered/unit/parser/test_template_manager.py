@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import msgspec
 
 from sglang.srt.parser.template_detection import (
+    HY4_FLASH_EFFORT_ALIASES,
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
@@ -39,6 +40,21 @@ def _patch_hf_transformers(get_tokenizer, get_config=None):
     return patch.dict(sys.modules, {module.__name__: module})
 
 
+_GRANITE_THINKING_TOGGLES = (
+    "{% set enable_thinking = enable_thinking if enable_thinking is defined else True %}\n"
+    "{% set truncate_history_thinking = truncate_history_thinking"
+    " if truncate_history_thinking is defined else True %}\n"
+)
+_GRANITE_DEFERRED_TOOL_LOADING = "{%- if tool.defer_loading is not defined or not tool.defer_loading %}{%- endif %}\n"
+_XML_TOOL_CALL_BLOCK = (
+    "<tool_call>\n<function=example_function_name>\n"
+    "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>"
+)
+_GRANITE_42_TEMPLATE = (
+    _GRANITE_THINKING_TOGGLES + _GRANITE_DEFERRED_TOOL_LOADING + _XML_TOOL_CALL_BLOCK
+)
+
+
 def _glm53_template(concat):
     """GLM-5.3 shape: always-on thinking behind a ``Reasoning Effort:`` header
     (no ``enable_thinking`` toggle) and the compact GLM-4.7 tool-call format;
@@ -66,6 +82,20 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
             template, _DummyTokenizer(vocab), config, force
         )
         return force, config, parser
+
+    def test_lfm3_template_ignores_legacy_lfm2_vocab(self):
+        template = (
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+            "<think><tool_call><function=get_weather><parameter=city>Warsaw"
+            "</parameter></function></tool_call>"
+        )
+        vocab = ["<|tool_call_start|>", "<|tool_call_end|>", "<tool_call>"]
+        force, config, parser = self._detect(template, vocab)
+        self.assertEqual(parser, "qwen3")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer(vocab), config, force),
+            "qwen3_coder",
+        )
 
     def test_iquest_template_wins_over_generic_think_and_xml_rules(self):
         template = "<|iquest_assistant|><think><iquest_tool_call><arg_key><arg_value>"
@@ -433,6 +463,29 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
 
         self.assertEqual(config, ReasoningToggleConfig(special_case="hunyuan_effort"))
         self.assertNotEqual(parser, "hunyuan")
+
+    HYV4_FLASH_TEMPLATE = HYV4_TEMPLATE.replace(
+        "['high', 'low', 'no_think']", "['max', 'high', 'no_think']"
+    )
+
+    def test_hyv4_flash_effort_template_gets_aliases(self):
+        # Hy4-flash knows max instead of low; low must not reach its template.
+        force, config, parser = self._detect(self.HYV4_FLASH_TEMPLATE, self.HYV4_VOCAB)
+
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(
+                special_case="hunyuan_effort",
+                effort_aliases=HY4_FLASH_EFFORT_ALIASES,
+            ),
+        )
+        self.assertEqual(parser, "hunyuan")
+        self.assertEqual(
+            detect_tool_call_parser(
+                self.HYV4_FLASH_TEMPLATE, _DummyTokenizer(self.HYV4_VOCAB), config, force
+            ),
+            "hunyuan",
+        )
 
 
 class TestTemplateDetectionRuleMatrix(unittest.TestCase):
@@ -886,13 +939,13 @@ class TestToolCallParserDetection(unittest.TestCase):
                     "{% endfor %}"
                 ),
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
-                "glm45",
+                "glm",
             ),
             (
                 "xml_kv_tool_call_via_vocab",
                 "{% set reasoning_effort = reasoning_effort | default('high', true) %}\n<think>",
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
-                "glm45",
+                "glm",
             ),
         ]
         for name, template, vocab, expected in cases:
@@ -903,9 +956,43 @@ class TestToolCallParserDetection(unittest.TestCase):
                 )
                 self.assertEqual(result, expected)
 
+    def test_granite_tool_parser_needs_xml_block_and_granite_signature(self):
+        cases = [
+            ("granite_4_2", _GRANITE_42_TEMPLATE, "granite_toolcall_parser"),
+            (
+                "nemotron_3_shared_xml_block",
+                _GRANITE_THINKING_TOGGLES + _XML_TOOL_CALL_BLOCK,
+                "qwen3_coder",
+            ),
+            (
+                "granite_signature_without_xml_block",
+                _GRANITE_THINKING_TOGGLES + _GRANITE_DEFERRED_TOOL_LOADING,
+                "qwen",
+            ),
+            (
+                "granite_4_0_json_tool_call",
+                "For each tool call, return a json object with function name and "
+                "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+                '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>',
+                None,
+            ),
+            (
+                "granite_3_3_tool_call_token",
+                "respond only with <|tool_call|> followed by a JSON list of tools used.",
+                None,
+            ),
+        ]
+        for name, template, expected in cases:
+            with self.subTest(name=name):
+                force, config = detect_reasoning_pattern(template)
+                result = detect_tool_call_parser(
+                    template, _DummyTokenizer([]), config, force
+                )
+                self.assertEqual(result, expected)
+
     def test_glm45_rule_precedes_xml_kv_fallback(self):
         # The specific GLM-4.5 family check must run before the generic
-        # xml_kv_tool_call fallback. Both currently map to "glm45", so the
+        # xml_kv_tool_call fallback. Both currently map to "glm", so the
         # value-based test above can't catch a swap — assert positions directly.
         rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
         self.assertLess(rule_index["glm47"], rule_index["glm45"])
@@ -935,6 +1022,9 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertLess(tool_index["hunyuan"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["poolside_v1"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["step3p5"], tool_index["qwen3_coder"])
+        self.assertLess(
+            tool_index["granite_toolcall_parser"], tool_index["qwen3_coder"]
+        )
         self.assertLess(tool_index["step3"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["qwen3_coder"], tool_index["qwen"])
 
@@ -1080,6 +1170,16 @@ class TestResolveAutoParsers(CustomTestCase):
 
         self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
         self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+
+    def test_tool_only_auto_selects_granite_tool_parser(self):
+        args = self._make_server_args(tool_call_parser="auto")
+        tokenizer = _DummyTokenizer([], chat_template=_GRANITE_42_TEMPLATE)
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "tool_call_parser"), "granite_toolcall_parser")
+        self.assertIsNone(_declared(args, "reasoning_parser"))
 
     def test_response_template_fills_undetected_parsers(self):
         args = self._make_server_args(

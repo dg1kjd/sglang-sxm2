@@ -36,6 +36,9 @@ from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
@@ -201,7 +204,8 @@ class QSAIndexer(MultiPlatformOp):
         """Whether the fused indexer-prep kernels support this configuration."""
         cache = getattr(self.rotary_emb, "cos_sin_cache", None)
         return (
-            tensor.is_cuda
+            not _is_npu
+            and tensor.is_cuda
             and tensor.dtype in (torch.bfloat16, torch.float16)
             and self.index_head_dim in (64, 128, 256)
             and self.rotary_emb.rotary_dim % 2 == 0
@@ -562,7 +566,11 @@ class QSAIndexer(MultiPlatformOp):
             return output
 
         relative = (
-            max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG
+            not _is_npu
+            and max_row_keys is not None
+            and max_row_keys > 0
+            and q.is_cuda
+            and HAS_TILELANG
         )
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows,
@@ -643,7 +651,8 @@ class QSAIndexer(MultiPlatformOp):
         # ordered_topk writes 0..length-1 for rows that fit k without reading their
         # scores, and never uses a score past a row's length.
         use_fast_topk = (
-            q.is_cuda
+            not _is_npu
+            and q.is_cuda
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
@@ -956,6 +965,17 @@ class QSAIndexer(MultiPlatformOp):
             forward_batch,
             indexer_metadata,
             skip_prefill_selection=skip_prefill_selection,
+        )
+
+    def forward_npu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        return self._forward_impl(
+            hidden_states, positions, forward_batch, indexer_metadata
         )
 
 

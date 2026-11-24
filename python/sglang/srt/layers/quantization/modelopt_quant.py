@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8Mo
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
+    apply_fp8_linear_deterministic,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     flashinfer_per_tensor_fp8_supported,
@@ -68,7 +69,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.device import get_device_capability, is_cuda
@@ -306,6 +307,36 @@ _SUPPORTED_ACT_STRS = ("silu", "relu2", "gelu")
 def _is_sm70() -> bool:
     """True when running on NVIDIA V100 (compute capability 7.x)."""
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 7
+
+
+def _sm70_w13_column_multiplier(
+    gate_scale2: torch.Tensor,
+    up_scale2: torch.Tensor,
+    common_scale2: torch.Tensor,
+    size_n: int,
+) -> torch.Tensor:
+    """Per-expert block-scale multipliers that move W13 onto one global scale.
+
+    W13 rows are [gate; up] (SM70 keeps the canonical order). Returns an
+    ``[E, 1, N]`` float32 tensor for the logical ``[E, K/16, N]`` block scales:
+    ``gate_scale2 / common_scale2`` over the gate half and
+    ``up_scale2 / common_scale2`` over the up half.
+    """
+    half = size_n // 2
+    multiplier = torch.empty(
+        (gate_scale2.shape[0], 1, size_n),
+        dtype=torch.float32,
+        device=gate_scale2.device,
+    )
+    multiplier[:, 0, :half] = (gate_scale2 / common_scale2)[:, None]
+    multiplier[:, 0, half:] = (up_scale2 / common_scale2)[:, None]
+    ratios = multiplier[:, 0, [0, half]]
+    if not torch.equal(ratios.log2().round().exp2(), ratios):
+        logger.warning_once(
+            "SM70 NVFP4: gate/up global scales differ by a factor that is not "
+            "a power of two; their block scales are rounded to 3 mantissa bits."
+        )
+    return multiplier
 
 
 @lru_cache(maxsize=8192)
@@ -659,6 +690,17 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 workspace=layer.workspace,
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+        if (
+            self.use_sm120_fp8
+            and get_exec().deterministic.enable_deterministic_inference
+        ):
+            return apply_fp8_linear_deterministic(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
                 bias=bias,
             )
         if self.use_sm120_fp8:
@@ -2484,7 +2526,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     #
     # "v2" (standard): cutedsl + none/flashinfer a2a.
     #   - MoeRunner fused func calls CuteDslMoEWrapper kernels.
-    #   - Expects W13 in [Up, Gate] order, interleaved in 64-row chunks.
+    #   - Expects W13 in [Up, Gate] order, interleaved in 16-row chunks for
+    #     Blackwell swap-AB, or 64-row chunks for the legacy layout.
     #   - Uses MMA-layout blockscales (w13_blockscale_mma).
 
     @property
@@ -2513,19 +2556,24 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _trtllm_hidden_alignment(self, layer) -> int:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            trtllm_nvfp4_hidden_alignment,
+        )
+
+        return trtllm_nvfp4_hidden_alignment(
+            use_per_token_activation=self.quant_config.use_per_token_activation,
+            is_gated=layer.moe_runner_config.is_gated,
+        )
+
     def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
         """Align TRT-LLM weights, allowing model-specific storage layouts."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             align_fp4_moe_weights_for_flashinfer_trtllm,
-            trtllm_nvfp4_hidden_alignment,
         )
 
         align_fp4_moe_weights_for_flashinfer_trtllm(
-            layer,
-            hidden_alignment=trtllm_nvfp4_hidden_alignment(
-                use_per_token_activation=self.quant_config.use_per_token_activation,
-                is_gated=layer.moe_runner_config.is_gated,
-            ),
+            layer, hidden_alignment=self._trtllm_hidden_alignment(layer)
         )
 
     def create_weights(
@@ -2998,10 +3046,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.device,
             )
 
+        # The TRT-LLM runner pads a misaligned hidden dim and so needs BF16
+        # activations; FP4 dispatch would quantize them at the unpadded size.
+        trtllm_pads_hidden = (
+            self.enable_flashinfer_trtllm_moe
+            and layer.hidden_size % self._trtllm_hidden_alignment(layer) != 0
+        )
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
             not self.quant_config.use_per_token_activation
             and not use_w4a16
+            and not trtllm_pads_hidden
             and (
                 use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
             )
@@ -3053,14 +3108,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # Weight processing based on strategy
         if self.is_sm70:
             # Both SM70 paths consume the checkpoint's per-expert tensor
-            # scales directly. ModelOpt emits matching gate/up scales for a
-            # fused W13 tensor; process_weights_after_loading validated this
-            # above and selected the gate scale.
+            # scales directly, one per expert for the fused W13. Where the
+            # gate and up scales differ, the larger becomes the expert's
+            # scale and the other half's block scales are multiplied by
+            # (its scale / larger) <= 1, so the fp16 encoding cannot overflow.
+            w13_column_multiplier = None
             if (
                 layer.moe_runner_config.is_gated
                 and layer.w13_weight_scale_2.dim() == 2
             ):
-                w13_scale2 = layer.w13_weight_scale_2[:, 0].to(torch.float32)
+                gate_scale2 = layer.w13_weight_scale_2[:, 0].to(torch.float32)
+                up_scale2 = layer.w13_weight_scale_2[:, 1].to(torch.float32)
+                w13_scale2 = torch.maximum(gate_scale2, up_scale2)
+                if not torch.equal(gate_scale2, up_scale2):
+                    w13_column_multiplier = _sm70_w13_column_multiplier(
+                        gate_scale2,
+                        up_scale2,
+                        w13_scale2,
+                        size_n=layer.w13_weight_scale.shape[1],
+                    )
             else:
                 w13_scale2 = layer.w13_weight_scale_2.to(torch.float32)
             w13_scale2 = w13_scale2.contiguous().reshape(-1)
@@ -3069,6 +3135,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             if not self.use_sm70_marlin:
+                if w13_column_multiplier is not None:
+                    raise NotImplementedError(
+                        "SM70 NVFP4 Triton fallback needs equal gate/up global "
+                        "scales; this checkpoint needs marlin_v100."
+                    )
                 # Portable correctness fallback: retain raw [E,N,K/2] codes
                 # and [E,N,K/16] scales for Triton's on-the-fly decoder.
                 copy_or_rebind_param(layer, "w13_scale2", w13_scale2)
@@ -3128,6 +3199,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 sm70_nvfp4_marlin_process_scales(
                     layer.w13_weight_scale.transpose(1, 2).contiguous(),
                     layer.params_dtype,
+                    column_multiplier=w13_column_multiplier,
                 )
             )
             w2_marlin_scales, w2_scale_factor = (
@@ -3209,27 +3281,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # CUTLASS processing - handle w13 and w2 separately
 
             if self._is_cutedsl_v2_standard and layer.moe_runner_config.is_gated:
-                # CuteDSL v2 only: interleave the two logical W13 halves in
-                # 64-row chunks for the fused SwiGLU GEMM1 layout expected by
-                # CuteDslMoEWrapper.  The v1 (deepep) path uses
-                # grouped_gemm_nt_masked which expects plain contiguous halves.
+                # Prepare paired [up, gate] weights/scales before swizzling,
+                # using the same layout as CuteDslMoEWrapper. The v1 (deepep)
+                # masked GEMM keeps plain contiguous halves.
+                from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
+
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                    interleave_w13_halves,
+                    use_cutedsl_moe_swap_ab,
                 )
 
-                copy_or_rebind_param(
-                    layer,
-                    "w13_weight",
-                    interleave_w13_halves(
-                        layer.w13_weight.view(torch.uint8), group_size=64, dim=1
-                    ).contiguous(),
+                w13_weight, w13_weight_scale = interleave_cute_dsl_moe_weights(
+                    layer.w13_weight.view(torch.uint8),
+                    layer.w13_weight_scale,
+                    swap_ab=use_cutedsl_moe_swap_ab(layer.w13_weight.device),
                 )
+                copy_or_rebind_param(layer, "w13_weight", w13_weight.contiguous())
                 copy_or_rebind_param(
-                    layer,
-                    "w13_weight_scale",
-                    interleave_w13_halves(
-                        layer.w13_weight_scale, group_size=64, dim=1
-                    ).contiguous(),
+                    layer, "w13_weight_scale", w13_weight_scale.contiguous()
                 )
 
             # Process w13 weights

@@ -84,6 +84,9 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         return quant_config
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        Glm5NextForConditionalGeneration.register_modelslim_projection_aliases(
+            quant_config
+        )
         super().__init__(
             getattr(config, "text_config", config),
             quant_config=quant_config,

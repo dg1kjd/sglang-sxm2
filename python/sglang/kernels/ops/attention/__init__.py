@@ -63,6 +63,7 @@ _TRITON_KERNELS = [
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
+    ("beam_shared_context", "shared_context_attention"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -455,7 +456,8 @@ register_kernel(
         ),
     )
 )
-# SM70 sparse MLA, NoPE latent 512 fp16. Indexer-selected rows, fp32 softmax.
+# SM70 sparse MLA, latent 512 fp16 with an optional 64-d rope tail, per-head
+# sinks and per-row lengths. Indexer-selected rows, fp32 softmax.
 register_kernel(
     KernelSpec(
         op="attention.sparse_mla_sm70",
@@ -472,6 +474,78 @@ register_kernel(
         op="attention.sm70_grouped_decode",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.sm70_grouped_decode:sm70_grouped_decode",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+    )
+)
+# SM70 Hunyuan-4-Flash IndexPool indexer: fp16 pooled keys and queries,
+# HMMA scores, exact top-k with token expansion.
+register_kernel(
+    KernelSpec(
+        op="attention.hy4_indexpool_query_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.hy4_flash_indexpool_sm70:indexpool_query_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.hy4_indexpool_store_raw_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.hy4_flash_indexpool_sm70:indexpool_store_raw_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.hy4_indexpool_pool_write_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.hy4_flash_indexpool_sm70:indexpool_pool_write_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.hy4_indexpool_decode_update_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.hy4_flash_indexpool_sm70:indexpool_decode_update_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.hy4_indexpool_logits_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.hy4_flash_indexpool_sm70:indexpool_logits_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.hy4_indexpool_topk_expand_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.hy4_flash_indexpool_sm70:indexpool_topk_expand_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.hy4_indexpool_select_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.hy4_flash_indexpool_sm70:indexpool_select_sm70",
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
         ),
@@ -643,6 +717,14 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+register_kernel(
+    KernelSpec(
+        op="attention.fused_qkv_gating_gdn_prefill",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.triton_gdn_fused_proj:fused_qkv_gating_gdn_prefill",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
 # tcgen05 + TMEM: datacenter Blackwell only (SM100 / SM103), not SM120.
 for _mod, _fn in [
     ("linear.gdn_blackwell", "chunk_gated_delta_rule_cutedsl"),
@@ -822,3 +904,25 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
+for _op, _module in (
+    ("finish_prefill_indexer_topk", "fp4_indexer"),
+    ("select_candidate_block_ids_triton", "candidate_blocks"),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_op}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.{_module}:{_op}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _op, _module

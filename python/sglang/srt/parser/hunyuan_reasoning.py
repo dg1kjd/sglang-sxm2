@@ -25,8 +25,11 @@ def normalize_hunyuan_reasoning_effort(
     effort = request.reasoning_effort
     if effort is None and request.chat_template_kwargs is not None:
         effort = request.chat_template_kwargs.get("reasoning_effort")
+    aliases = dict(reasoning_config.effort_aliases)
     if effort is None:
         normalized_effort = "high"
+    elif effort in aliases:
+        normalized_effort = aliases[effort]
     elif effort in ("none", "no_think"):
         normalized_effort = "no_think"
     elif effort in ("minimal", "low"):

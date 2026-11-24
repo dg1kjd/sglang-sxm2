@@ -14,6 +14,8 @@ Incorporates work from:
 - **[That80-20](https://github.com/That80-20)** ([issue #5](https://github.com/dg1kjd/sglang-sxm2/issues/5)): found that a fresh install missed a TurboMind header (`csrc/sm70_tile_runtime_signal.cuh`) and that the installer stopped on a host without Rust, with the fix for both.
 - **[WANDY666](https://github.com/WANDY666)** ([sgl-project/sglang#47281](https://github.com/sgl-project/sglang/pull/47281)): SenseNova-Loop support (the looped layer plan, the mHC router, the config and the tests), which the SenseNova-Loop-9B port here starts from.
 - **[frankier](https://github.com/frankier)** ([frankier/sglang-sxm2](https://github.com/frankier/sglang-sxm2)): their GLM-5.3 vision work suggested checking at launch that the image processor imports, and running the vision tower one image at a time.
+- **[Qiaolin Yu](https://github.com/Qiaolin-Yu)** ([sgl-project/sglang#51159](https://github.com/sgl-project/sglang/pull/51159)): Hunyuan-4-Flash (Hy4-flash) support, with the text model, the vision-language model and DFly speculative decoding, which the Hy4-flash port here starts from.
+- **[Avifenesh](https://huggingface.co/Avifenesh)** ([Avifenesh/Hy4-flash-NVFP4](https://huggingface.co/Avifenesh/Hy4-flash-NVFP4)): the NVFP4 quantization of Hy4-flash that the Hy4-flash engine here serves.
 
 Volta kernels by: [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy), [marlin_v100](https://github.com/zhinianqin/marlin_v100), [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100), [v100-skinny](https://github.com/dnv2003/v100-skinny) (QPN8 FP8 decode GEMV), [CUTLASS](https://github.com/NVIDIA/cutlass), [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and [TileLang](https://github.com/tile-ai/tilelang).
 

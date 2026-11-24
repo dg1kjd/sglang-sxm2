@@ -317,6 +317,7 @@ build takes about an hour; `MAX_JOBS` caps the compiler parallelism.
 | service | model | GPUs | port | checkpoint under `MODELS_DIR` |
 |---|---|---|---|---|
 | `glm53` | GLM-5.3-Flash | 8 | 11435 | `GLM-5.3-Flash-NVFP4` |
+| `hy4` | Hy4-flash, DFly | 8 | 11435 | `Hy4-flash-NVFP4` |
 | `qwen38` | Qwen3.8-Flash-Next, MTP | 4 | 11435 | `Qwen3.8-Flash-Next-NVFP4` |
 | `dsv41` | DeepSeek-V4.1-Flash | 8 | 11435 | `DeepSeek-V4.1-Flash` |
 | `h3` | MiniMax-H3 video | 4 | 30010 | `MiniMax-H3` |

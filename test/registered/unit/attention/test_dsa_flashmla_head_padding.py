@@ -34,7 +34,9 @@ class TestFlashMLASparseHeadPadding(CustomTestCase):
             self.assertEqual(active, 8 if heads <= 8 else 32)
             self.assertEqual(padded.shape, (3, 64, dim))
             torch.testing.assert_close(padded[:, :heads], q)
-            self.assertEqual(torch.count_nonzero(padded[:, heads:]).item(), 0)
+            # The compact kernel reads only the active heads; the gap up to
+            # them is zeroed, the rest of the Q64 tile is left as allocated.
+            self.assertEqual(torch.count_nonzero(padded[:, heads:active]).item(), 0)
             torch.testing.assert_close(sinks[:heads], sink)
             self.assertEqual(torch.count_nonzero(sinks[heads:]).item(), 0)
             self.assertIs(lens, lengths)
@@ -52,6 +54,7 @@ class TestFlashMLASparseHeadPadding(CustomTestCase):
         backend = SimpleNamespace(
             device_sm_major=10,
             sparse_prefill_small_heads=enabled,
+            dsa_index_topk=topk,
             _sink_pad_cache={},
             _call_flash_mla_sparse_fwd_small_heads=small,
             _call_flash_mla_sparse_fwd=native,

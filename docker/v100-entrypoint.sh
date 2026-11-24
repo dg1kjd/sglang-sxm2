@@ -31,6 +31,9 @@ case "${1:-}" in
   dsv41)
     shift; smoke
     exec bash scripts/serve_dsv41_v100.sh "$@" ;;
+  hy4)
+    shift; smoke
+    exec bash scripts/serve_hy4_flash_nvfp4_v100.sh "$@" ;;
   h3)
     shift; smoke
     exec bash scripts/serve_minimax_h3_v100.sh "$@" ;;

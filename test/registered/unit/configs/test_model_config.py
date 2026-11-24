@@ -17,8 +17,11 @@ from transformers import (
 )
 
 from sglang.srt.arg_groups.model_override_base import model_config_of
+from sglang.srt.configs.hy_v4_flash import HYV4FlashConfig
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    get_dsa_raw_index_key_bytes,
+    get_dsa_raw_index_key_layer_count,
     get_hybrid_layer_ids,
     is_embedding_gemma,
     is_embedding_nemotron3,
@@ -121,6 +124,35 @@ class TestHybridLayerIds(CustomTestCase):
         self.assertTrue(is_hybrid_swa_model(["Gemma4ForCausalLM"], config))
         self.assertFalse(is_layer_types_hybrid_swa_model(["Gemma4ForCausalLM"], config))
         self.assertTrue(is_layer_types_hybrid_swa_model(["Gemma3ForCausalLM"], config))
+
+
+class TestHy4FlashHybridLayers(CustomTestCase):
+    """Hy4-Flash keeps only the sliding window of its sliding layers, and the
+    pool sizing counts the raw index keys of its sparse layers."""
+
+    def setUp(self):
+        sparse, sliding = "deepseek_sparse_attention", "sliding_attention"
+        self.config = HYV4FlashConfig(
+            architectures=["HYV4FlashForConditionalGeneration"],
+            text_config=dict(
+                num_hidden_layers=6,
+                layer_types=[sparse, sparse, sliding, sliding, sliding, sparse],
+            ),
+        )
+
+    def test_sliding_layers_are_the_window_layers(self):
+        architectures, text_config = self.config.architectures, self.config.text_config
+        self.assertTrue(is_hybrid_swa_model(architectures, text_config))
+        self.assertEqual(
+            get_hybrid_layer_ids(architectures, text_config), ([2, 3, 4], [0, 1, 5])
+        )
+
+    def test_raw_index_keys_are_counted_per_sparse_layer(self):
+        self.assertEqual(get_dsa_raw_index_key_bytes(self.config), 128 * 2)
+        self.assertEqual(get_dsa_raw_index_key_layer_count(self.config), 3)
+        llama = LlamaConfig(architectures=["LlamaForCausalLM"])
+        self.assertEqual(get_dsa_raw_index_key_bytes(llama), 0)
+        self.assertEqual(get_dsa_raw_index_key_layer_count(llama), 0)
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):
@@ -422,6 +454,30 @@ class TestAudioUnderstandableFlag(CustomTestCase):
                 audio_config={"num_mel_bins": 128}
             ).is_audio_understandable_model
         )
+
+
+class TestDisableMultimodal(CustomTestCase):
+    """--disable-multimodal must make a multimodal-by-default checkpoint
+    text-only; the Rust server refuses to start a multimodal model it has no
+    pipeline for, so serving such a model there depends on this."""
+
+    def _build(self, **server_args):
+        with TemporaryDirectory() as checkpoint:
+            LlamaConfig(
+                architectures=["LlavaForConditionalGeneration"],
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                vocab_size=128,
+            ).save_pretrained(checkpoint)
+            return ModelConfig.from_server_args(
+                ServerArgs(model_path=checkpoint, **server_args)
+            )
+
+    def test_disable_turns_off_a_multimodal_checkpoint(self):
+        self.assertTrue(self._build().is_multimodal)
+        self.assertFalse(self._build(disable_multimodal=True).is_multimodal)
 
 
 class TestDefaultContextLength(CustomTestCase):

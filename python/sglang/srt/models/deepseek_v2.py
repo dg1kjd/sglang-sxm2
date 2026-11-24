@@ -72,6 +72,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.dsa_token_shard import dsa_token_shard_enabled
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
 )
@@ -583,8 +584,15 @@ class MoEGate(nn.Module):
             return F.linear(hidden_states.float(), self.weight.float(), None)
 
         if self.weight.dtype == torch.float16:
+            from sglang.kernels.ops.gemm import sm70_fixed_order_gemm
             from sglang.kernels.ops.moe import sm70_moe_glue
 
+            if envs.SGLANG_USE_SM70_FIXED_ORDER_GEMM.get() and (
+                sm70_fixed_order_gemm.supported(hidden_states, self.weight)
+            ):
+                return sm70_fixed_order_gemm.linear(
+                    hidden_states, self.weight, out_dtype=torch.float32
+                )
             if sm70_moe_glue.router_logits_covered(hidden_states, self.weight):
                 return sm70_moe_glue.router_logits(hidden_states, self.weight)
 
@@ -2332,6 +2340,22 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
+        # DSA token-shard: every head for this rank's slice of the tokens; the
+        # weights stay head-sharded. ``use_dsa``, not ``indexer is not None``: a
+        # skip-topk layer owns no Indexer but still attends, so it needs this.
+        self.attn_mqa_for_dsa_token_shard = None
+        if self.use_dsa and dsa_token_shard_enabled():
+            self.attn_mqa_for_dsa_token_shard = RadixAttention(
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
+
         self.attn_mha = RadixAttention(
             self.num_local_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -3215,6 +3239,7 @@ class DeepseekV2Model(nn.Module):
         self.layers_to_capture = []
         self.enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_deepep_v2()
         )
