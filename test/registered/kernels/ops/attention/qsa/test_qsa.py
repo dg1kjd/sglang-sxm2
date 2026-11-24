@@ -1101,7 +1101,9 @@ class _DispatchIndexer:
         self.selected = "prefill"
         return torch.tensor([1])
 
-    def select_decode_tokens(self, *args, defer_expansion=False):
+    def select_decode_tokens(
+        self, *args, defer_expansion=False, group_queries=False
+    ):
         self.selected = "decode"
         return torch.tensor([2])
 

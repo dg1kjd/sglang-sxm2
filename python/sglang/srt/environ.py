@@ -1802,11 +1802,27 @@ class Envs:
     SGLANG_SM70_MTP_SMALL_GEMM = EnvBool(True)
     SGLANG_SM70_MTP_QKVZBA = EnvBool(True)
     SGLANG_SM70_MTP_GDN = EnvBool(True)
+    # Qwen3.8 TP4 target verify with 5-16 rows on the SM70 NVFP4 MoE decode
+    # kernels, routes on one expert paired; bit-identical to the four-launch
+    # reference. 0 sends those batches to Marlin.
+    SGLANG_OPT_SM70_NVFP4_MOE_VERIFY_PAIRS = EnvBool(True)
+    # QSA indexer: score four verify rows per Volta MMA tile (close to, not
+    # bit-identical with, the per-row FP32 scorer), and route page-16 compressed
+    # keys to the SM70 scorer. 0 keeps the per-row scorer.
+    SGLANG_OPT_SM70_QSA_GROUPED_INDEXER = EnvBool(True)
+    # QSA H6/D256 decode and verify read the 512 selected block IDs directly
+    # instead of an expanded token list (same output). 0 expands first.
+    SGLANG_OPT_SM70_QSA_BLOCK_DECODE = EnvBool(True)
     SGLANG_SM70_QSA_COMBINE = EnvBool(True)
     SGLANG_SM70_QSA_DRAFT_EXTEND_GRAPH = EnvBool(True)
     # Native split-KV decode for group-4 D256 attention over fp16 KV at any batch
     # size (SenseNova-Loop-9B at TP 4). 0 falls back to Triton split-K for comparisons.
     SGLANG_SM70_FP16_GROUPED_DECODE = EnvBool(True)
+    # Sparse attention top-k on Volta lists the same tokens in ascending order on
+    # every run (the sparse kernels sum in list order): GLM's DSA k-pool top-k
+    # (top-k v2 mode 2 plus a sort) and DSV4.1's CSA2 decode (ordered_topk). 0 goes
+    # back to the faster-to-launch kernels whose order and ties vary between runs.
+    SGLANG_SM70_ORDERED_SPARSE_TOPK = EnvBool(True)
     # GLM-5.3-Flash NVFP4 batch-1..4 decode on Volta HMMA instead of Marlin:
     # dense/shared-expert GEMV and routed experts. fp32 accumulation, so
     # outputs differ from Marlin in the last fp16 bit.

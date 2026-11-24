@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_sm70_supported
 
 _is_cuda = is_cuda()
 
@@ -663,6 +663,11 @@ def _alloc_kpool_topk_out(
     return logits.new_full((out_rows, out_cols), -1, dtype=torch.int32)
 
 
+def _kpool_topk_deterministic() -> bool:
+    # Sparse MLA sums the selected tokens in list order: one order on every run.
+    return is_sm70_supported() and envs.SGLANG_SM70_ORDERED_SPARSE_TOPK.get()
+
+
 def _kpool_topk_v2_ragged(
     *,
     logits: torch.Tensor,
@@ -697,6 +702,7 @@ def _kpool_topk_v2_ragged(
             else page_table_row_index.to(torch.int32)
         ),
         out_offsets=topk_offsets,
+        deterministic=_kpool_topk_deterministic(),
     )
     return full
 
@@ -730,6 +736,7 @@ def _kpool_topk_v2(
         token_seq_lens=None if seq_lens is None else seq_lens.to(torch.int32),
         page_table=page_table,
         out_offsets=topk_offsets,
+        deterministic=_kpool_topk_deterministic(),
     )
     return full
 

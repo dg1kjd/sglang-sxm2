@@ -19,8 +19,11 @@ This project incorporates work from:
              and GDN kernels for V100, Apache 2.0)
 
     1Cat-vLLM -- vLLM for V100; source of the sm70 TurboMind block-FP8 and
-    FP16 MoE backend the build compiles
+    FP16 MoE backend the build compiles, and of the paired-route NVFP4 MoE
+    verify path and the grouped QSA indexer and block-ID decode for
+    Qwen3.8 (adapted in sm70_nvfp4_moe_decode.cu and sm70_longctx_decode.cu)
     https://github.com/1CatAI/1Cat-vLLM
+    Licensed under the Apache License, Version 2.0
 
 This is an independent project. It is not affiliated with, endorsed by, or
 supported by the SGLang project or LMSYS. Please do not file issues about this

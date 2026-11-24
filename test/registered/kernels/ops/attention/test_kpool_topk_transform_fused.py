@@ -24,6 +24,11 @@ import torch
 from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
     fast_kpool_topk_transform_fused,
 )
+from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+    build_kpool_topk_v2_plan,
+    topk_from_pooled_history_logits,
+)
+from sglang.srt.utils import is_sm70_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -254,6 +259,91 @@ def test_graph_replay_short_rows_page_mapping_and_tail(long_length):
             rtol=0,
         )
 
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_sm70_supported()), reason="Requires SM70"
+)
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+def test_sm70_pooled_history_topk_is_ordered_and_repeatable(phase):
+    """GLM's indexer top-k must give the same token list, in ascending pool order with
+    ties to the smaller pool, on every call: sparse MLA sums the list in order."""
+    torch.manual_seed(7)
+    rows, ctx, kpool, topk = 4, 32768, 4, 2048
+    seq_lens = torch.arange(ctx - rows + 1, ctx + 1, dtype=torch.int32, device="cuda")
+    pool_lens = seq_lens // kpool
+    width = int(pool_lens.max()) + 8
+    scores = torch.randint(0, 64, (rows, width), device="cuda").float()
+    pages = torch.randperm(2 * ctx, device="cuda")[: ctx + 8].int()
+    if phase == "decode":
+        page_table = pages.expand(rows, -1).contiguous()
+        kwargs = dict(page_table=page_table, seq_lens=seq_lens)
+        call = dict(kwargs, topk_v2_plan=build_kpool_topk_v2_plan(pool_lens))
+    else:
+        page_table = torch.stack([torch.randperm(2 * ctx, device="cuda")[: ctx + 8].int(), pages])
+        row_starts = torch.randint(0, 8, (rows,), dtype=torch.int32, device="cuda")
+        kwargs = dict(
+            page_table=page_table,
+            seq_lens=seq_lens,
+            row_starts=row_starts,
+            page_table_row_index=torch.ones(rows, dtype=torch.int32, device="cuda"),
+        )
+        call = kwargs
+
+    expected = fast_kpool_topk_transform_fused(
+        scores.clone(), pool_lens, kpool, topk, **kwargs
+    )
+    for _ in range(3):
+        result = topk_from_pooled_history_logits(
+            scores.clone(), pool_lens, kpool, topk, **call
+        )
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("group_topk", [100, 512, 1000, 1024, 1500, 2048])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_deterministic_kpool_v2_sorts_groups(group_topk, ragged):
+    """Top-k v2 k-pool calls with ``deterministic`` list the selected pools in ascending
+    order, for budgets up to and past the block size (the sort's two paths)."""
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_kpool_ragged_v2,
+        topk_transform_kpool_v2,
+    )
+
+    torch.manual_seed(group_topk)
+    rows, kpool = 3, 4
+    pool_lens = torch.tensor(
+        [group_topk - 7, group_topk + 1, 3 * group_topk + 5],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    width = (int(pool_lens.max()) + 3) // 4 * 4
+    # Distinct scores: the selected set is unique, so only the order is under test.
+    scores = torch.stack(
+        [torch.randperm(width, device="cuda").float() for _ in range(rows)]
+    )
+    out = torch.empty((rows, group_topk * kpool), dtype=torch.int32, device="cuda")
+    if ragged:
+        topk_transform_kpool_ragged_v2(
+            scores.clone(), pool_lens, out, kpool, deterministic=True
+        )
+    else:
+        plan = torch.empty((rows + 1, 2), dtype=torch.int32, device="cuda")
+        plan_topk_v2(pool_lens, out=plan)
+        topk_transform_kpool_v2(
+            scores.clone(), pool_lens, out, kpool, plan, deterministic=True
+        )
+
+    for r in range(rows):
+        n = int(pool_lens[r])
+        k = min(n, group_topk)
+        groups = scores[r, :n].topk(k).indices.sort().values.int()
+        tokens = (groups[:, None] * kpool + torch.arange(kpool, device="cuda")).flatten()
+        expected = torch.full_like(out[r], -1)
+        expected[: k * kpool] = tokens
+        torch.testing.assert_close(out[r], expected, atol=0, rtol=0)
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -1709,11 +1711,20 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def _can_defer_block_expansion(self, forward_mode):
         return (
-            self._fused_kv_pool_eligible
-            and self.qsa_profile is not None
+            self.qsa_profile is not None
             and self.compress_ratio == 4
-            and self.qsa_profile.block_topk == 512
             and (forward_mode.is_decode() or forward_mode.is_target_verify())
+            and self.qsa_profile.block_topk == 512
+            and (
+                self._fused_kv_pool_eligible
+                or (
+                    envs.SGLANG_OPT_SM70_QSA_BLOCK_DECODE.get()
+                    and not is_batch_invariant_mode_enabled()
+                    and self.device is not None
+                    and torch.device(self.device).type == "cuda"
+                    and torch.cuda.get_device_capability(self.device) == (7, 0)
+                )
+            )
         )
 
     def _uses_block_indices(self, indices):
@@ -2409,8 +2420,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.layer_router.read(layer.layer_id).key()
         v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
-        topk_indices = self._expand_block_indices(topk_indices, metadata)
         if _is_npu or not q.is_cuda:
+            topk_indices = self._expand_block_indices(topk_indices, metadata)
             slots = self._logical_to_physical(topk_indices, metadata)
             if _is_npu:
                 attention = _npu_sparse_attention
@@ -2448,6 +2459,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                     k_buffer.dtype,
                 )
                 self._sm70_sparse_decode_logged = True
+            query_positions = None
+            if self._uses_block_indices(topk_indices):
+                if (
+                    self.compress_ratio == 4
+                    and topk_indices.shape[1] == 512
+                    and envs.SGLANG_OPT_SM70_QSA_BLOCK_DECODE.get()
+                    and not is_batch_invariant_mode_enabled()
+                ):
+                    query_positions = metadata.indexer_metadata.decode_logical_positions
+                if query_positions is None:
+                    topk_indices = self._expand_block_indices(topk_indices, metadata)
             output = sm70_cuda_qsa_decode(
                 q,
                 k_buffer,
@@ -2457,8 +2479,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 metadata.sequence_lengths,
                 layer.scaling,
+                query_positions=query_positions,
             )
             return output.reshape(q.shape[0], -1)
+        topk_indices = self._expand_block_indices(topk_indices, metadata)
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(

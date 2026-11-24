@@ -783,7 +783,12 @@ def _prefill_low_ratio_sources(backend, layer, x, q_lora, positions, forward_bat
 
 def _select_topk(scores: torch.Tensor, lens32: torch.Tensor, k: int) -> torch.Tensor:
     """Row 0 top-k indices over ``scores[:, :lens]``; -1 where absent or -inf."""
-    if k in _FAST_TOPK_K:
+    if scores.is_cuda and envs.SGLANG_SM70_ORDERED_SPARSE_TOPK.get():
+        # Ascending, ties to the smaller index: the sparse decode sums in list order.
+        from sglang.kernels.ops.attention.ordered_topk import ordered_topk
+
+        idx = ordered_topk(scores, lens32, k)
+    elif k in _FAST_TOPK_K:
         from sglang.kernels.ops.attention.fast_topk import fast_topk
 
         idx = fast_topk(scores, lens32, k)

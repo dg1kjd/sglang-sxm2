@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -15,6 +16,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -141,15 +146,24 @@ def fused_experts_none_to_marlin(
         )
 
     # Qwen3.8 Flash Next's TP4 decode shape is too skinny for Marlin's
-    # block-padded grouped GEMM: M<=4 routes ten rows through I=160 experts.
-    # On Volta, stream the existing Marlin-repacked NVFP4 tensors directly and
-    # split K widely enough to occupy all 80 SMs. Keep Marlin for prefill and
-    # every other model/shape.
+    # block-padded grouped GEMM. Stream the existing Marlin pack on Volta.
+    # Speculative verification and draft extend can have up to four rows per
+    # request. Only those modes may use the wider specialization.
+    num_rows = hidden_states.shape[0]
+    max_decode_rows = 4
+    if (
+        4 < num_rows <= 16
+        and envs.SGLANG_OPT_SM70_NVFP4_MOE_VERIFY_PAIRS.get()
+        and has_forward_context()
+    ):
+        mode = get_forward_context().forward_mode
+        if mode is not None and (mode.is_target_verify() or mode.is_draft_extend_v2()):
+            max_decode_rows = 16
     routed_scale = runner_config.routed_scaling_factor
     use_sm70_nvfp4_decode = (
         hidden_states.dtype == torch.float16
         and hidden_states.ndim == 2
-        and 1 <= hidden_states.shape[0] <= 4
+        and 1 <= num_rows <= max_decode_rows
         and hidden_states.shape[1] == 2560
         and tuple(topk_output.topk_ids.shape) == (hidden_states.shape[0], 10)
         and tuple(quant_info.w13_qweight.shape) == (512, 160, 640)
@@ -157,6 +171,8 @@ def fused_experts_none_to_marlin(
         and quant_info.weight_bits == 4
         and quant_info.w13_qzeros is None
         and quant_info.w2_qzeros is None
+        and quant_info.w13_bias is None
+        and quant_info.w2_bias is None
         and quant_info.w13_scales.dtype == torch.float8_e4m3fn
         and quant_info.w2_scales.dtype == torch.float8_e4m3fn
         and quant_info.w13_global_scale is not None
@@ -227,7 +243,6 @@ def fused_experts_none_to_marlin(
             sm70_hy4_nvfp4_moe_available,
             sm70_hy4_nvfp4_moe_eligible,
         )
-        from sglang.srt.environ import envs
         from sglang.srt.layers import zero_copy_context
 
         if (

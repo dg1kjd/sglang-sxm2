@@ -934,7 +934,7 @@ def test_decode_block_selection_is_ordered_and_tie_stable(monkeypatch):
     # Past a row's length the decode scorer leaves the buffer unset.
     logits.masked_fill_(columns >= lengths[:, None], 1e9)
 
-    def mock_mqa_decode(*args, min_scored_len):
+    def mock_mqa_decode(*args, min_scored_len, group_queries=False):
         assert min_scored_len == 512
         return logits
 

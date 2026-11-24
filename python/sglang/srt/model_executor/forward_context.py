@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +51,7 @@ class ForwardContext:
     tbo_parent_token_range: Optional[tuple[int, int]] = None
     # This DP rank's first parent row when the child's MoE sees gathered rows.
     tbo_parent_dp_offset: Optional[int] = None
+    forward_mode: Optional[ForwardMode] = None
 
 
 _current: Optional[ForwardContext] = None
@@ -98,7 +100,9 @@ def forward_context(
 ):
     if forward_batch is not None:
         ctx = replace(
-            ctx, moe_num_token_non_padded=forward_batch.moe_num_token_non_padded
+            ctx,
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            forward_mode=forward_batch.forward_mode,
         )
     elif ctx.moe_num_token_non_padded is None and _current is not None:
         ctx = replace(ctx, moe_num_token_non_padded=_current.moe_num_token_non_padded)

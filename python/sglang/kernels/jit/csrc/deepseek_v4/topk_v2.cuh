@@ -235,11 +235,85 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransfor
   });
 }
 
+/// `sort_staged_ascending` for topk <= kN <= kBlockSize: one slot per thread in a register (+inf
+/// past `topk`); partners in the same warp come by shuffle, the others through shared memory,
+/// alternating between `keys[0, kN)` and `keys[kN, 2 kN)` (the staging buffer holds kMaxTopK) so
+/// each such step needs one barrier.
+template <uint32_t kN>
+SGL_DEVICE void sort_staged_ascending_regs(uint32_t* keys, uint32_t topk) {
+  static_assert(kN >= 32 && kN <= kBlockSize && 2 * kN <= kMaxTopK && (kN & (kN - 1)) == 0);
+  const uint32_t idx = threadIdx.x;
+  const bool active = idx < kN;  // whole warps, since kN is a multiple of 32
+  uint32_t v = idx < topk ? keys[idx] : UINT32_MAX;
+  uint32_t smem_steps = 0;
+#pragma unroll
+  for (uint32_t half = 1; half < kN; half <<= 1) {
+#pragma unroll
+    for (uint32_t j = half; j > 0; j >>= 1) {
+      const uint32_t mask = j == half ? 2 * half - 1 : j;  // the first step of each merge is mirrored
+      uint32_t p = 0;
+      if (mask < 32) {
+        if (active) p = __shfl_xor_sync(0xffffffffu, v, mask);
+      } else {
+        uint32_t* const buf = keys + (smem_steps++ % 2) * kN;
+        if (active) buf[idx] = v;
+        __syncthreads();
+        if (active) p = buf[idx ^ mask];
+      }
+      if (active) v = (idx & j) ? max(v, p) : min(v, p);
+    }
+  }
+  __syncthreads();
+  if (idx < topk) keys[idx] = v;
+  __syncthreads();
+}
+
+/// Sorts this block's staged selection ascending (-1 last) in place: every thread of the block
+/// calls it, `staged` is shared memory. A bitonic network over the next power of two, with the
+/// first step of each merge mirrored so every compare puts the smaller value at the lower index.
+/// Slots past `topk` act as +inf and stay there, so they need no storage.
+SGL_DEVICE void sort_staged_ascending(int32_t* staged, uint32_t topk) {
+  static_assert(kMaxTopK <= 2 * kBlockSize, "one compare-exchange per thread and step");
+  auto* const keys = reinterpret_cast<uint32_t*>(staged);
+  if (topk > kBlockSize) {
+    // Shared memory only: each thread exchanges one pair per step.
+    const uint32_t pair = threadIdx.x;
+    const auto exchange = [&](uint32_t lo, uint32_t hi) {
+      if (hi < topk) {
+        const uint32_t a = keys[lo], b = keys[hi];
+        if (a > b) {
+          keys[lo] = b;
+          keys[hi] = a;
+        }
+      }
+    };
+    for (uint32_t half = 1; half < topk; half <<= 1) {
+      const uint32_t lo = ((pair & ~(half - 1)) << 1) | (pair & (half - 1));
+      exchange(lo, lo ^ (2 * half - 1));
+      __syncthreads();
+      for (uint32_t j = half >> 1; j > 0; j >>= 1) {
+        const uint32_t lo_j = ((pair & ~(j - 1)) << 1) | (pair & (j - 1));
+        exchange(lo_j, lo_j + j);
+        __syncthreads();
+      }
+    }
+    return;
+  }
+  if (topk <= 32) return sort_staged_ascending_regs<32>(keys, topk);
+  if (topk <= 64) return sort_staged_ascending_regs<64>(keys, topk);
+  if (topk <= 128) return sort_staged_ascending_regs<128>(keys, topk);
+  if (topk <= 256) return sort_staged_ascending_regs<256>(keys, topk);
+  if (topk <= 512) return sort_staged_ascending_regs<512>(keys, topk);
+  return sort_staged_ascending_regs<1024>(keys, topk);
+}
+
 template <TopKMode kMode>
 SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const PageTransform& transform) {
   static_assert(kMode != TopKMode::INDICES, "paged_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
   if constexpr (kMode == TopKMode::KPOOL) {
+    // Mode 2: the attention sums the expanded tokens in list order, so the list is sorted too.
+    if constexpr (impl::kDeterministic) sort_staged_ascending(problem.out, problem.topk);
     const auto staged = problem.out;
     return kpool_expand(problem.seq_len, problem.topk, out, transform, [staged](uint32_t r) { return staged[r]; });
   }

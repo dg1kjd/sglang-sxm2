@@ -405,14 +405,17 @@ def topk_transform_kpool_v2(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 1,
     out_offsets: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> None:
     """GLM k-pool top-k over per-pool scores, fused with pool expansion, the
     ``token_seq_lens % pool_size`` tail and the page-table or offset transform.
+    ``deterministic`` builds the call in top-k mode 2 (ties to the smaller pool)
+    and sorts each row's pools ascending, so the output is the same on every run.
 
     ``metadata`` is :func:`plan_topk_v2` over ``pool_lens``. The kernel reads it
     before its PDL wait, so plan before launching the kernel that writes ``scores``.
     """
-    _jit_topk_v2_module().topk_transform_kpool(
+    _jit_topk_v2_module(deterministic).topk_transform_kpool(
         scores,
         pool_lens,
         token_seq_lens,
@@ -437,14 +440,15 @@ def topk_transform_kpool_ragged_v2(
     page_table_row_index: Optional[torch.Tensor] = None,
     page_size: int = 1,
     out_offsets: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> None:
     """Ragged (prefill) :func:`topk_transform_kpool_v2`: row ``i`` selects among
     ``scores[i, ks : ks + pool_lens[i]]`` (``ks = row_starts[i]``, 0 when omitted);
-    no plan is needed.
+    no plan is needed. ``deterministic`` as in :func:`topk_transform_kpool_v2`.
 
     NOTE: ``scores`` is written in place, as in :func:`topk_transform_ragged_v2`.
     """
-    _jit_topk_v2_module().topk_transform_kpool_ragged(
+    _jit_topk_v2_module(deterministic).topk_transform_kpool_ragged(
         scores,
         pool_lens,
         row_starts,
