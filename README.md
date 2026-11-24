@@ -22,7 +22,7 @@ SXM2 (NVLink) is only needed for speed. Any set of 32 GB V100s works, PCIe cards
 | **[DeepSeek-V4.1-Flash](docs/v100/DeepSeek-V4.1-Flash.md)**, official MXFP8 + MXFP4, DSpark | 8× V100 32 GB, ~300 GiB host RAM | 256k | **Best reasoning and world knowledge** here. The full official checkpoint, for agentic coding where answer quality matters more than speed |
 | **[Hy4-flash](docs/v100/Hy4-flash.md)**, 220B MoE, NVFP4, DFly | 8× V100 32 GB | 262k | New. Fast tool-call turns over the full 262k context, image and video input. Still being evaluated against GLM-5.3-Flash |
 | **[MiniMax-H3](docs/v100/MiniMax-H3.md)**, video + audio | 4× V100 32 GB | 4–15 s clips | Text-to-video, keyframes, reference image/video/audio |
-| **[SenseNova-Loop-9B](docs/v100/SenseNova-Loop-9B.md)**, 9B looped, fp16 *(experimental)* | 4× V100 32 GB | 262k | Experimental. A small model with image input, 12 parallel requests per 4 GPUs, a second copy on GPUs 4–7 with `SENSENOVA_DP=2` |
+| **[SenseNova-Loop-9B](docs/v100/SenseNova-Loop-9B.md)**, 9B looped, fp16 *(experimental)* | 4× V100 32 GB | 262k | Experimental. A small model with image input, 12 parallel requests per 4 GPUs. With 8 GPUs, `SENSENOVA_DP=2` runs a second copy |
 
 Each model page has the full measurements, the exact launch recipe, and why each flag has its value. Other models may load, but they are untested here.
 
@@ -89,7 +89,7 @@ On 4 GPUs, a 5 s 960×544 clip takes 50 steps of 10–12 s each. A 5 s 1344×768
 
 A 9B model that runs layers 4–27 twice for each token. It runs in fp16 on 4 GPUs, without MTP.
 
-- **Decode:** ~70 tok/s for one stream, ~617 tok/s summed over 12 streams at ~19k context. Up to 12 requests run at once. The KV pool holds 854k tokens, so about three of them can be at the full 262k context. `SENSENOVA_DP=2` (or `auto`) runs a second copy on GPUs 4–7 behind the same port: 1051 tok/s over 24 streams, for batch jobs (each copy keeps its own prefix cache).
+- **Decode:** ~70 tok/s for one stream, ~617 tok/s summed over 12 streams at ~19k context. Up to 12 requests run at once. The KV pool holds 854k tokens, so about three of them can be at the full 262k context. On an 8-GPU host, `SENSENOVA_DP=2` (or `auto`) runs a second copy on the other four GPUs behind the same port: 1051 tok/s over 24 streams, for batch jobs (each copy keeps its own prefix cache).
 - **Turns:** a short tool-call turn answers in ~0.11 s. With a 245k conversation cached, a short follow-up question takes ~1.4 s; the cold 245k prompt takes ~110–130 s.
 - **Images:** a 3840×2160 image (8,202 tokens) takes ~4 s.
 - **Sampling:** without a top-k cut the model can draw a very unlikely token and then repeat it until `max_tokens` ([Known issues](docs/v100/Known-Issues.md)). The serve script therefore sets top_k 20 for requests that set none. A request's own `top_k` wins.
