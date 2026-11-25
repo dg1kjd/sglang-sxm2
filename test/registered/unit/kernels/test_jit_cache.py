@@ -593,5 +593,47 @@ def test_sm70_load_inline_dirs_separate_sources_and_compilers(tmp_path, monkeypa
     assert sm70_jit_build_dir("~/ext", "kernel v1", ["-O3"]).startswith(base)
 
 
+def test_sm70_build_dirs_follow_sglang_cache_dir(tmp_path):
+    """The V100 kernels compiled on first use build under SGLANG_CACHE_DIR, so a
+    reboot that clears /tmp (often tmpfs) does not rebuild them."""
+    from sglang.srt.environ import envs
+
+    dirs = {
+        envs.SGLANG_SM70_GLM_NVFP4_BUILD_DIR: "glm_nvfp4_gemv",
+        envs.SGLANG_V100_NVFP4_MOE_BUILD_DIR: "sm70_nvfp4_moe",
+        envs.SGLANG_V100_DECODE_CUDA_BUILD_DIR: "sm70_longctx_decode",
+        envs.SGLANG_SM70_QPN8_BUILD_DIR: "sm70_qpn8",
+    }
+    with envs.SGLANG_CACHE_DIR.override(str(tmp_path)):
+        for env, name in dirs.items():
+            assert env.get() == str(tmp_path / name)
+
+
+def test_sm70_load_inline_removes_a_stale_build_lock(tmp_path, monkeypatch):
+    """torch waits forever on the lock file of a build whose process was killed;
+    with the build directory on disk that file outlives a reboot. Under the
+    flock it can only be stale, so it is removed before torch looks."""
+    import torch.utils.cpp_extension
+
+    from sglang.kernels.sm70_paths import sm70_jit_build_dir, sm70_load_inline
+
+    base = str(tmp_path / "ext")
+    build_dir = sm70_jit_build_dir(base, "kernel", ["-O3"])
+    pathlib.Path(build_dir, "lock").touch()
+    seen = {}
+
+    def fake_load_inline(**kwargs):
+        seen.update(kwargs)
+        seen["lock_left"] = os.path.exists(
+            os.path.join(kwargs["build_directory"], "lock")
+        )
+        return "module"
+
+    monkeypatch.setattr(torch.utils.cpp_extension, "load_inline", fake_load_inline)
+    assert sm70_load_inline("ext_name", base, "kernel", ["-O3"]) == "module"
+    assert seen["build_directory"] == build_dir and not seen["lock_left"]
+    assert seen["name"] == "ext_name" and seen["cuda_sources"] == "kernel"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

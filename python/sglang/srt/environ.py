@@ -1823,12 +1823,24 @@ class Envs:
     # (top-k v2 mode 2 plus a sort) and DSV4.1's CSA2 decode (ordered_topk). 0 goes
     # back to the faster-to-launch kernels whose order and ties vary between runs.
     SGLANG_SM70_ORDERED_SPARSE_TOPK = EnvBool(True)
+    # Build directories of the SM70 kernels compiled on first use (sm70_paths.
+    # sm70_load_inline). Under SGLANG_CACHE_DIR, so builds survive a reboot
+    # (/tmp is often tmpfs) and one setting moves them all.
+    SGLANG_SM70_GLM_NVFP4_BUILD_DIR = EnvStr(
+        lambda: _default_cache_subdir("glm_nvfp4_gemv")
+    )
+    SGLANG_V100_NVFP4_MOE_BUILD_DIR = EnvStr(
+        lambda: _default_cache_subdir("sm70_nvfp4_moe")
+    )
+    SGLANG_V100_DECODE_CUDA_BUILD_DIR = EnvStr(
+        lambda: _default_cache_subdir("sm70_longctx_decode")
+    )
+    SGLANG_SM70_QPN8_BUILD_DIR = EnvStr(lambda: _default_cache_subdir("sm70_qpn8"))
     # GLM-5.3-Flash NVFP4 batch-1..4 decode on Volta HMMA instead of Marlin:
     # dense/shared-expert GEMV and routed experts. fp32 accumulation, so
     # outputs differ from Marlin in the last fp16 bit.
     SGLANG_SM70_GLM_NVFP4_GEMV = EnvBool(False)
     SGLANG_SM70_GLM_NVFP4_MOE_DECODE = EnvBool(False)
-    SGLANG_SM70_GLM_NVFP4_BUILD_DIR = EnvStr("~/.cache/sglang/glm_nvfp4_gemv")
     # Hunyuan-4-Flash NVFP4 routed experts at TP8 on Volta HMMA instead of
     # Marlin, decode and prefill, batch invariant (a token's bits do not depend
     # on the batch). Same fp16 rounding points as Marlin; the fp32 sum order

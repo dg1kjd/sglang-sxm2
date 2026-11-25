@@ -330,7 +330,7 @@ unlimited `memlock` for pinned host memory, and all GPUs.
 | mount | in the container | holds |
 |---|---|---|
 | `${MODELS_DIR:-~/models}` | `/models`, read-only | checkpoints |
-| volume `sglang-sxm2-cache` | `/root/.cache` | Hugging Face cache, Qwen's host KV tier, DeepSeek's session store |
+| volume `sglang-sxm2-cache` | `/root/.cache` | Hugging Face cache, Qwen's host KV tier, DeepSeek's session store, the SM70 kernels built on first use (`sglang/`) |
 | volume `sglang-sxm2-jit` | `/root/sglang-v100-jit` | FlashInfer, TileLang, Triton and Inductor JIT kernels |
 
 ### Using it

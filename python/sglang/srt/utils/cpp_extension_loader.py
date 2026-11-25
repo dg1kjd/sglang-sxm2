@@ -92,7 +92,7 @@ def _is_recoverable_load_error(
 
 
 @contextmanager
-def _extension_build_lock(build_directory: Path) -> Iterator[None]:
+def extension_build_lock(build_directory: Path) -> Iterator[None]:
     """Serialize builds and discard PyTorch lock files left by dead processes."""
     build_directory.parent.mkdir(parents=True, exist_ok=True)
     lock_path = build_directory.parent / f".{build_directory.name}.sglang.lock"
@@ -138,7 +138,7 @@ def load_extension_with_recovery(
         "verbose": verbose,
     }
 
-    with _extension_build_lock(build_directory):
+    with extension_build_lock(build_directory):
         try:
             return load(**load_kwargs)
         except Exception as exc:

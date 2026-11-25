@@ -115,3 +115,28 @@ def sm70_jit_build_dir(base: str, source: str, cuda_cflags: Sequence[str]) -> st
     )
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def sm70_load_inline(name: str, base: str, source: str, cuda_cflags: Sequence[str]):
+    """Build (or load the cached build of) one SM70 CUDA source as a Python module.
+
+    The build directory is ``sm70_jit_build_dir(base, ...)``. torch waits forever
+    on a ``lock`` file left by a process killed mid-build; under the flock of
+    ``extension_build_lock`` such a file can only be stale and is removed first.
+    """
+    from torch.utils.cpp_extension import load_inline
+
+    from sglang.srt.utils.cpp_extension_loader import extension_build_lock
+
+    build_directory = sm70_jit_build_dir(base, source, cuda_cflags)
+    with extension_build_lock(Path(build_directory)):
+        return load_inline(
+            name=name,
+            cpp_sources="",
+            cuda_sources=source,
+            functions=None,
+            is_python_module=True,
+            verbose=False,
+            build_directory=build_directory,
+            extra_cuda_cflags=list(cuda_cflags),
+        )

@@ -7,11 +7,10 @@ decode. Prefill (M > 4) stays on Marlin.
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 
-from sglang.kernels.sm70_paths import sm70_csrc, sm70_jit_build_dir
+from sglang.kernels.sm70_paths import sm70_csrc, sm70_load_inline
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -43,23 +42,12 @@ def _load():
     if not _SRC_PATH.is_file():
         logger.warning("GLM NVFP4 GEMV source missing: %s", _SRC_PATH)
         return None
-    from torch.utils.cpp_extension import load_inline
-
-    source = _SRC_PATH.read_text()
-    cuda_cflags = ["-O3", "--use_fast_math"]
-    build_directory = sm70_jit_build_dir(
-        envs.SGLANG_SM70_GLM_NVFP4_BUILD_DIR.get(), source, cuda_cflags
-    )
     try:
-        _EXT = load_inline(
-            name="sglang_sm70_glm_nvfp4_gemv",
-            cpp_sources="",
-            cuda_sources=source,
-            functions=None,
-            is_python_module=True,
-            verbose=False,
-            build_directory=build_directory,
-            extra_cuda_cflags=cuda_cflags,
+        _EXT = sm70_load_inline(
+            "sglang_sm70_glm_nvfp4_gemv",
+            envs.SGLANG_SM70_GLM_NVFP4_BUILD_DIR.get(),
+            _SRC_PATH.read_text(),
+            ["-O3", "--use_fast_math"],
         )
     except Exception:
         logger.exception("GLM NVFP4 GEMV extension failed to build")

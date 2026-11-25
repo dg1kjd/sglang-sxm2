@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 
 import torch
 
-from sglang.kernels.sm70_paths import sm70_csrc, sm70_jit_build_dir
+from sglang.kernels.sm70_paths import sm70_csrc, sm70_load_inline
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +44,12 @@ def _load_sm70_nvfp4_moe_decode_ops():
         logger.warning("SM70 NVFP4 MoE decode source not found: %s", _SRC_PATH)
         return None
 
-    from torch.utils.cpp_extension import load_inline
-
-    source = _SRC_PATH.read_text()
-    cuda_cflags = ["-O3", "--use_fast_math"]
-    build_directory = sm70_jit_build_dir(
-        os.environ.get("SGLANG_V100_NVFP4_MOE_BUILD_DIR", "/tmp/sglang_sm70_nvfp4_moe"),
-        source,
-        cuda_cflags,
-    )
     try:
-        _EXT = load_inline(
-            name="sglang_sm70_nvfp4_moe_v100",
-            cpp_sources="",
-            cuda_sources=source,
-            functions=None,
-            is_python_module=True,
-            verbose=False,
-            build_directory=build_directory,
-            extra_cuda_cflags=cuda_cflags,
+        _EXT = sm70_load_inline(
+            "sglang_sm70_nvfp4_moe_v100",
+            envs.SGLANG_V100_NVFP4_MOE_BUILD_DIR.get(),
+            _SRC_PATH.read_text(),
+            ["-O3", "--use_fast_math"],
         )
     except Exception:  # pragma: no cover - build failures are environment-specific
         logger.exception("SM70 NVFP4 MoE decode extension failed to build")
